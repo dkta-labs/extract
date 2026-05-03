@@ -1,0 +1,17 @@
+[Unit]
+Description=extract.dkta.dev — x402 content extraction API
+After=network.target
+
+[Service]
+Type=simple
+User=hermes
+WorkingDirectory=/opt/extract
+Environment=PORT=3721
+Environment=NETWORK=base
+EnvironmentFile=/opt/extract/.env
+ExecStart=/usr/bin/node index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

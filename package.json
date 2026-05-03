@@ -1,0 +1,23 @@
+{
+  "name": "extract",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@coinbase/x402": "^2.1.0",
+    "@mozilla/readability": "^0.6.0",
+    "express": "^5.2.1",
+    "jsdom": "^29.1.1",
+    "node-fetch": "^3.3.2",
+    "viem": "^2.48.8",
+    "x402": "^1.2.0",
+    "x402-express": "^1.2.0"
+  }
+}
