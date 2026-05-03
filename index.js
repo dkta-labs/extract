@@ -77,6 +77,218 @@ app.get('/v1/extract', async (req, res) => {
   }
 })
 
+// ─── OpenAPI spec ────────────────────────────────────────────────────────────
+const openApiSpec = {
+  openapi: '3.0.3',
+  info: {
+    title: 'extract.dkta.dev',
+    version: '1.0.0',
+    description:
+      'Clean content extraction for AI agents. Every request to `GET /v1/extract` ' +
+      'requires a micropayment of **$0.001 USDC** on Base mainnet via the ' +
+      '[x402 protocol](https://x402.org). Send the signed payment in the ' +
+      '`X-PAYMENT` request header.',
+  },
+  servers: [{ url: 'https://extract.dkta.dev', description: 'Production' }],
+  paths: {
+    '/v1/extract': {
+      get: {
+        summary: 'Extract readable content from a URL',
+        description:
+          'Fetches the target URL, strips boilerplate with Mozilla Readability, ' +
+          'and returns structured plain-text content. Requires an x402 micropayment ' +
+          '($0.001 USDC on Base mainnet) in the `X-PAYMENT` header.',
+        operationId: 'extractUrl',
+        parameters: [
+          {
+            name: 'url',
+            in: 'query',
+            required: true,
+            description: 'Fully-qualified URL to extract content from',
+            schema: { type: 'string', format: 'uri', example: 'https://example.com/article' },
+          },
+        ],
+        security: [{ x402Payment: [] }],
+        responses: {
+          '200': {
+            description: 'Extracted content',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    title:   { type: 'string', description: 'Article title', nullable: true },
+                    byline:  { type: 'string', description: 'Author / byline', nullable: true },
+                    content: { type: 'string', description: 'Readable HTML content returned by Readability', nullable: true },
+                    length:  { type: 'integer', description: 'Character length of the extracted plain text' },
+                    excerpt: { type: 'string', description: 'Short excerpt / lead paragraph', nullable: true },
+                  },
+                  required: ['length'],
+                },
+                example: {
+                  title: 'Hello World',
+                  byline: 'Jane Doe',
+                  content: '<p>Article body…</p>',
+                  length: 4821,
+                  excerpt: 'A short preview of the article…',
+                },
+              },
+            },
+          },
+          '400': {
+            description: 'Bad request — missing or invalid `url` parameter',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+              },
+            },
+          },
+          '402': {
+            description:
+              'Payment required. The server returns x402-compliant payment details. ' +
+              'Re-submit the request with a valid `X-PAYMENT` header containing the ' +
+              'signed USDC transfer.',
+            headers: {
+              'X-Payment-Response': {
+                description: 'x402 payment challenge details (JSON-encoded)',
+                schema: { type: 'string' },
+              },
+            },
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    error:   { type: 'string', example: 'Payment required' },
+                    accepts: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          scheme:  { type: 'string', example: 'exact' },
+                          network: { type: 'string', example: 'base' },
+                          maxAmountRequired: { type: 'string', example: '1000' },
+                          resource: { type: 'string', example: 'https://extract.dkta.dev/v1/extract' },
+                          description: { type: 'string' },
+                          mimeType: { type: 'string', example: 'application/json' },
+                          payTo: { type: 'string', example: '0x9C924E0b95FBE2Fe69D6ecDb434AEBFa15E236b2' },
+                          requiredDeadlineSeconds: { type: 'integer', example: 300 },
+                          asset: { type: 'string', example: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
+                          extra: { type: 'object' },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '422': {
+            description: 'Content could not be extracted from the target URL',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+              },
+            },
+          },
+          '502': {
+            description: 'Upstream URL returned a non-2xx response',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+              },
+            },
+          },
+          '500': {
+            description: 'Internal server error',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/openapi.json': {
+      get: {
+        summary: 'OpenAPI specification',
+        operationId: 'getOpenApiSpec',
+        responses: {
+          '200': { description: 'OpenAPI 3.0 JSON spec' },
+        },
+      },
+    },
+    '/docs': {
+      get: {
+        summary: 'Swagger UI documentation',
+        operationId: 'getDocs',
+        responses: {
+          '200': { description: 'Interactive Swagger UI HTML page' },
+        },
+      },
+    },
+  },
+  components: {
+    securitySchemes: {
+      x402Payment: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-PAYMENT',
+        description:
+          'x402 signed payment header. Obtain via an x402-compatible wallet client ' +
+          '(e.g. `x402-fetch`) by signing a USDC transfer of $0.001 on Base mainnet ' +
+          'payable to `0x9C924E0b95FBE2Fe69D6ecDb434AEBFa15E236b2`.',
+      },
+    },
+    schemas: {
+      Error: {
+        type: 'object',
+        properties: {
+          error: { type: 'string' },
+        },
+        required: ['error'],
+      },
+    },
+  },
+}
+
+app.get('/openapi.json', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.json(openApiSpec)
+})
+
+app.get('/docs', (_req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>extract.dkta.dev — API Docs</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+  <style>
+    body { margin: 0; background: #0a0a0a; }
+    .swagger-ui .topbar { background: #141414; border-bottom: 1px solid #222; }
+    .swagger-ui .topbar .download-url-wrapper { display: none; }
+  </style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+  <script>
+    SwaggerUIBundle({
+      url: '/openapi.json',
+      dom_id: '#swagger-ui',
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+      layout: 'StandaloneLayout',
+      deepLinking: true,
+    })
+  </script>
+</body>
+</html>`)
+})
+
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
 app.get('/', (_req, res) => {
