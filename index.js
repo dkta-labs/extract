@@ -50,7 +50,8 @@ const PORT = process.env.PORT || 3721
 const PAYMENT_ADDRESS = process.env.PAYMENT_ADDRESS || '0x1A7501Da9b9B365910F8C57EE19Bec7C620d0468'
 const NETWORK = process.env.NETWORK || 'base'
 
-// CORS headers required so browser-based agents can read 402 challenges and payment headers
+// CORS headers required so browser-based agents can read 402 challenges and payment headers.
+// Scoped to /v1/extract and discovery endpoints only — not applied globally.
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, OPTIONS',
@@ -58,21 +59,31 @@ const CORS_HEADERS = {
   'Access-Control-Expose-Headers': 'x-payment-response, www-authenticate',
 }
 
+function applyCors(res) {
+  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v))
+}
+
 // Handle CORS preflight BEFORE payment middleware — OPTIONS must return 200, not 402
 app.options('/v1/extract', (req, res) => {
-  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v))
+  applyCors(res)
   res.sendStatus(200)
 })
 
-// Inject CORS + Cache-Control onto every response (including 402s from paymentMiddleware)
-app.use((req, res, next) => {
-  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v))
-  const origJson = res.json.bind(res)
-  res.json = function (body) {
-    if (res.statusCode === 402) {
+// Scoped CORS — only /v1/extract and well-known discovery routes
+app.use(['/v1/extract', '/.well-known/x402', '/.well-known/x402.json', '/openapi.json'], (req, res, next) => {
+  applyCors(res)
+  next()
+})
+
+// Ensure 402 responses are never cached regardless of how paymentMiddleware sends them.
+// Hook writeHead so this fires even if x402-express uses res.send/res.end rather than res.json.
+app.use('/v1/extract', (req, res, next) => {
+  const _writeHead = res.writeHead.bind(res)
+  res.writeHead = function (statusCode, ...args) {
+    if (statusCode === 402) {
       res.setHeader('Cache-Control', 'private, no-store')
     }
-    return origJson(body)
+    return _writeHead(statusCode, ...args)
   }
   next()
 })
