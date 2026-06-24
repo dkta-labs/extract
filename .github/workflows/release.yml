@@ -1,0 +1,12 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  notify-infra:
+    uses: dkta-labs/infra/.github/workflows/notify-release.yml@main
+    with:
+      service: extract
+    secrets: inherit
