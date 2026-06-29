@@ -1,0 +1,109 @@
+# extract.dkta.dev
+
+> Clean content extraction for AI agents. Pay per call via x402 on Base.
+
+## API
+
+### GET /v1/extract?url=<url>&format=<markdown|text>
+
+Returns structured content extracted from any URL. Requires x402 micropayment of $0.001 USDC on Base mainnet in the X-PAYMENT header.
+
+**Response:**
+
+```json
+{
+  "title": "Article Title",
+  "byline": "Author Name",
+  "url": "https://...",
+  "content": "# Markdown content...",
+  "length": 4821,
+  "word_count": 800,
+  "extraction_method": "crawl4ai",
+  "lang": "en"
+}
+```
+
+**Response headers:** `X-RateLimit-Limit: 20`, `X-RateLimit-Remaining: 19`
+
+### POST /v1/extract/batch
+
+Batch extract from up to 5 URLs in a single request. Requires x402 micropayment of $0.005 USDC on Base mainnet.
+
+**Request body:**
+
+```json
+{
+  "urls": ["https://example.com/article1", "https://example.com/article2"],
+  "format": "markdown"
+}
+```
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "title": "Article Title",
+      "byline": "Author Name",
+      "url": "https://example.com/article1",
+      "content": "# Markdown content...",
+      "length": 4821,
+      "word_count": 800,
+      "extraction_method": "crawl4ai",
+      "lang": "en"
+    },
+    {
+      "url": "https://example.com/article2",
+      "error": "upstream returned 404"
+    }
+  ]
+}
+```
+
+Per-URL errors are returned inline — the overall response is still 200. Max 5 URLs per request.
+
+**Response headers:** `X-RateLimit-Limit: 20`, `X-RateLimit-Remaining: 19`
+
+## Response fields
+
+- `title` — article title (nullable)
+- `byline` — author/byline (nullable)
+- `url` — canonical URL of the extracted page
+- `content` — extracted markdown or plain text
+- `length` — character count of extracted content
+- `word_count` — approximate word count
+- `extraction_method` — `"crawl4ai"` or `"readability"` (which backend was used)
+- `lang` — detected language code (e.g. `"en"`, `"zh"`)
+- `error` — present only on per-URL batch failures
+
+## Payment
+
+Use an x402-compatible client (e.g. x402-fetch npm package) with a USDC wallet on Base mainnet.
+
+```js
+import { wrapWithPaymentClientFetch } from 'x402-fetch'
+const fetch = wrapWithPaymentClientFetch(globalThis.fetch, walletClient)
+
+// Single extraction — $0.001 USDC
+const res = await fetch('https://extract.dkta.dev/v1/extract?url=https://example.com')
+const { title, content, word_count, extraction_method, lang } = await res.json()
+
+// Batch extraction — $0.005 USDC
+const batchRes = await fetch('https://extract.dkta.dev/v1/extract/batch', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ urls: ['https://example.com', 'https://example.org'] }),
+})
+const { results } = await batchRes.json()
+```
+
+## Pricing
+
+- Single extraction: $0.001 USDC per request
+- Batch extraction (up to 5 URLs): $0.005 USDC per request
+
+## Docs
+- OpenAPI spec: https://extract.dkta.dev/openapi.json
+- Interactive docs: https://extract.dkta.dev/docs
+- x402 protocol: https://x402.org

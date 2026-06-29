@@ -54,7 +54,7 @@ const NETWORK = process.env.NETWORK || 'base'
 // Scoped to /v1/extract and discovery endpoints only — not applied globally.
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'content-type, x-payment, payment-signature, x-payment-signature, authorization',
   'Access-Control-Expose-Headers': 'x-payment-response, www-authenticate',
 }
@@ -68,16 +68,20 @@ app.options('/v1/extract', (req, res) => {
   applyCors(res)
   res.sendStatus(200)
 })
+app.options('/v1/extract/batch', (req, res) => {
+  applyCors(res)
+  res.sendStatus(200)
+})
 
-// Scoped CORS — only /v1/extract and well-known discovery routes
-app.use(['/v1/extract', '/.well-known/x402', '/.well-known/x402.json', '/openapi.json'], (req, res, next) => {
+// Scoped CORS — only /v1/extract routes and well-known discovery routes
+app.use(['/v1/extract', '/v1/extract/batch', '/.well-known/x402', '/.well-known/x402.json', '/openapi.json'], (req, res, next) => {
   applyCors(res)
   next()
 })
 
 // Ensure 402 responses are never cached regardless of how paymentMiddleware sends them.
 // Hook writeHead so this fires even if x402-express uses res.send/res.end rather than res.json.
-app.use('/v1/extract', (req, res, next) => {
+app.use(['/v1/extract', '/v1/extract/batch'], (req, res, next) => {
   const _writeHead = res.writeHead.bind(res)
   res.writeHead = function (statusCode, ...args) {
     if (statusCode === 402) {
@@ -88,14 +92,52 @@ app.use('/v1/extract', (req, res, next) => {
   next()
 })
 
-// x402 payment gate — $0.001 per extraction
+// x402 payment gate — $0.001 per extraction, $0.005 per batch
 app.use(paymentMiddleware(
   PAYMENT_ADDRESS,
   {
-    '/v1/extract': {
+    'GET /v1/extract': {
       price: '$0.001',
       network: NETWORK,
-      config: { description: 'Extract clean markdown from any URL' },
+      config: {
+        description: 'Extract clean markdown from any URL',
+        inputSchema: {
+          properties: {
+            url: { type: 'string', description: 'Fully-qualified URL to extract content from' },
+            format: { type: 'string', enum: ['markdown', 'text'], description: 'Output format' },
+          },
+          required: ['url'],
+        },
+        outputSchema: {
+          example: { title: 'Article Title', byline: 'Author', content: '# Markdown...', length: 4821, word_count: 800, extraction_method: 'crawl4ai', lang: 'en' },
+          schema: {
+            properties: {
+              title: { type: 'string' },
+              byline: { type: 'string' },
+              url: { type: 'string' },
+              content: { type: 'string' },
+              length: { type: 'number' },
+              word_count: { type: 'number' },
+              extraction_method: { type: 'string', enum: ['crawl4ai', 'readability'] },
+              lang: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+    'POST /v1/extract/batch': {
+      price: '$0.005',
+      network: NETWORK,
+      config: {
+        description: 'Batch extract clean markdown from up to 5 URLs',
+        inputSchema: {
+          properties: {
+            urls: { type: 'array', items: { type: 'string' }, description: 'Array of URLs to extract (max 5)' },
+            format: { type: 'string', enum: ['markdown', 'text'], description: 'Output format' },
+          },
+          required: ['urls'],
+        },
+      },
     },
   },
   {
@@ -106,6 +148,13 @@ app.use(paymentMiddleware(
     )
   }
 ))
+
+// Simple language detection: check first 100 chars for CJK codepoints, default to 'en'
+function detectLang(text) {
+  const sample = text ? text.slice(0, 100) : ''
+  if (/[\u3000-\u9FFF\uF900-\uFAFF\uAC00-\uD7AF]/.test(sample)) return 'zh'
+  return 'en'
+}
 
 app.get('/v1/extract', async (req, res) => {
   const { url, format = 'markdown' } = req.query
@@ -131,6 +180,7 @@ app.get('/v1/extract', async (req, res) => {
     let markdownContent = null
     let title = null
     let byline = null
+    let extraction_method = 'readability'
 
     try {
       const crawlRes = await fetch('http://localhost:11235/md', {
@@ -143,6 +193,7 @@ app.get('/v1/extract', async (req, res) => {
         const crawlData = await crawlRes.json()
         if (crawlData.markdown && crawlData.markdown.trim()) {
           markdownContent = crawlData.markdown.trim()
+          extraction_method = 'crawl4ai'
         }
       }
     } catch (_) { /* crawl4ai unavailable, fall through to Readability */ }
@@ -150,6 +201,7 @@ app.get('/v1/extract', async (req, res) => {
     // Fall back to Readability if crawl4ai returned empty or errored
     let plainText = null
     if (!markdownContent) {
+      extraction_method = 'readability'
       const response = await fetch(targetUrl.toString(), {
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; extract-api/1.0)' },
         redirect: 'follow',
@@ -183,19 +235,131 @@ app.get('/v1/extract', async (req, res) => {
       ? (plainText || markdownContent.replace(/[#*`_~\[\]]/g, '').replace(/\s+/g, ' ').trim())
       : (markdownContent || plainText)
 
+    const word_count = content ? content.trim().split(/\s+/).filter(Boolean).length : 0
+    const lang = detectLang(content)
     const result = {
       title,
       byline,
       url: targetUrl.toString(),
       content,
       length: content.length,
+      word_count,
+      extraction_method,
+      lang,
     }
     const duration_ms = Date.now() - start
     logRequest({ ts, ip, event: 'success', url: targetUrl.toString(), length: content.length, format, paid: true })
     umamiEvent('extract-request', { status: 200, paid: true, format, length: content.length, duration_ms })
+    res.setHeader('X-RateLimit-Limit', '20')
+    res.setHeader('X-RateLimit-Remaining', '19')
     return res.json(result)
   } catch (err) {
     umamiEvent('extract-request', { status: 500, reason: err.message, paid: true })
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+// ─── Batch extraction endpoint ────────────────────────────────────────────────
+app.post('/v1/extract/batch', express.json(), async (req, res) => {
+  const ts = new Date().toISOString()
+  const ip = req.ip
+  const start = Date.now()
+  const { urls, format = 'markdown' } = req.body || {}
+
+  if (!urls || !Array.isArray(urls) || urls.length === 0) {
+    logRequest({ ts, ip, event: 'bad_request', reason: 'missing_urls', endpoint: 'batch' })
+    return res.status(400).json({ error: 'urls array required' })
+  }
+  if (urls.length > 5) {
+    logRequest({ ts, ip, event: 'bad_request', reason: 'too_many_urls', count: urls.length, endpoint: 'batch' })
+    return res.status(400).json({ error: 'maximum 5 URLs per batch request' })
+  }
+
+  // Helper to extract a single URL (reuses same crawl4ai → Readability logic)
+  async function extractOne(urlStr) {
+    let targetUrl
+    try {
+      targetUrl = new URL(urlStr)
+    } catch {
+      return { url: urlStr, error: 'invalid url' }
+    }
+    try {
+      let markdownContent = null
+      let title = null
+      let byline = null
+      let extraction_method = 'readability'
+
+      try {
+        const crawlRes = await fetch('http://localhost:11235/md', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: targetUrl.toString(), f: 'fit' }),
+          timeout: 15000,
+        })
+        if (crawlRes.ok) {
+          const crawlData = await crawlRes.json()
+          if (crawlData.markdown && crawlData.markdown.trim()) {
+            markdownContent = crawlData.markdown.trim()
+            extraction_method = 'crawl4ai'
+          }
+        }
+      } catch (_) { /* crawl4ai unavailable, fall through to Readability */ }
+
+      let plainText = null
+      if (!markdownContent) {
+        extraction_method = 'readability'
+        const response = await fetch(targetUrl.toString(), {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; extract-api/1.0)' },
+          redirect: 'follow',
+          timeout: 10000,
+        })
+        if (!response.ok) {
+          return { url: targetUrl.toString(), error: `upstream returned ${response.status}` }
+        }
+        const html = await response.text()
+        const dom = new JSDOM(html, { url: targetUrl.toString() })
+        const reader = new Readability(dom.window.document)
+        const article = reader.parse()
+        if (!article) {
+          return { url: targetUrl.toString(), error: 'could not extract readable content from url' }
+        }
+        title = article.title
+        byline = article.byline
+        const textDom = new JSDOM(article.content)
+        plainText = textDom.window.document.body.textContent.replace(/\s+/g, ' ').trim()
+      }
+
+      const content = (format === 'text')
+        ? (plainText || markdownContent.replace(/[#*`_~\[\]]/g, '').replace(/\s+/g, ' ').trim())
+        : (markdownContent || plainText)
+
+      const word_count = content ? content.trim().split(/\s+/).filter(Boolean).length : 0
+      const lang = detectLang(content)
+      return {
+        title,
+        byline,
+        url: targetUrl.toString(),
+        content,
+        length: content.length,
+        word_count,
+        extraction_method,
+        lang,
+      }
+    } catch (err) {
+      return { url: urlStr, error: err.message }
+    }
+  }
+
+  try {
+    const results = await Promise.all(urls.map(u => extractOne(u)))
+    const duration_ms = Date.now() - start
+    logRequest({ ts, ip, event: 'success', endpoint: 'batch', count: urls.length, format, paid: true, duration_ms })
+    umamiEvent('extract-batch', { status: 200, paid: true, format, count: urls.length, duration_ms })
+    res.setHeader('X-RateLimit-Limit', '20')
+    res.setHeader('X-RateLimit-Remaining', '19')
+    return res.json({ results })
+  } catch (err) {
+    umamiEvent('extract-batch', { status: 500, reason: err.message, paid: true })
     return res.status(500).json({ error: err.message })
   }
 })
@@ -205,7 +369,7 @@ const openApiSpec = {
   openapi: '3.0.3',
   info: {
     title: 'extract.dkta.dev',
-    version: '1.0.0',
+    version: '1.1.0',
     description:
       'Clean content extraction for AI agents. Every request to `GET /v1/extract` ' +
       'requires a micropayment of **$0.001 USDC** on Base mainnet via the ' +
@@ -242,36 +406,42 @@ const openApiSpec = {
         responses: {
           '200': {
             description: 'Extracted content',
+            headers: {
+              'X-RateLimit-Limit': { description: 'Request limit per window', schema: { type: 'integer', example: 20 } },
+              'X-RateLimit-Remaining': { description: 'Requests remaining in window', schema: { type: 'integer', example: 19 } },
+            },
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
                   properties: {
-                    title:   { type: 'string', description: 'Article title', nullable: true },
-                    byline:  { type: 'string', description: 'Author / byline', nullable: true },
-                    content: { type: 'string', description: 'Markdown or plain text depending on format param', nullable: true },
-                    length:  { type: 'integer', description: 'Character length of the extracted plain text' },
-                    excerpt: { type: 'string', description: 'Short excerpt / lead paragraph', nullable: true },
+                    title:            { type: 'string', description: 'Article title', nullable: true },
+                    byline:           { type: 'string', description: 'Author / byline', nullable: true },
+                    url:              { type: 'string', description: 'Canonical URL of the extracted page' },
+                    content:          { type: 'string', description: 'Markdown or plain text depending on format param', nullable: true },
+                    length:           { type: 'integer', description: 'Character length of the extracted content' },
+                    word_count:       { type: 'integer', description: 'Approximate word count of extracted content' },
+                    extraction_method: { type: 'string', enum: ['crawl4ai', 'readability'], description: 'Backend used for extraction' },
+                    lang:             { type: 'string', description: 'Detected language (e.g. "en", "zh")' },
                   },
-                  required: ['length'],
+                  required: ['length', 'word_count', 'extraction_method', 'lang'],
                 },
                 example: {
                   title: 'Hello World',
                   byline: 'Jane Doe',
-                  content: '<p>Article body…</p>',
+                  url: 'https://example.com/article',
+                  content: '# Hello World\n\nArticle body…',
                   length: 4821,
-                  excerpt: 'A short preview of the article…',
+                  word_count: 800,
+                  extraction_method: 'crawl4ai',
+                  lang: 'en',
                 },
               },
             },
           },
           '400': {
             description: 'Bad request — missing or invalid `url` parameter',
-            content: {
-              'application/json': {
-                schema: { $ref: '#/components/schemas/Error' },
-              },
-            },
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '402': {
             description:
@@ -315,27 +485,92 @@ const openApiSpec = {
           },
           '422': {
             description: 'Content could not be extracted from the target URL',
-            content: {
-              'application/json': {
-                schema: { $ref: '#/components/schemas/Error' },
-              },
-            },
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '502': {
             description: 'Upstream URL returned a non-2xx response',
-            content: {
-              'application/json': {
-                schema: { $ref: '#/components/schemas/Error' },
-              },
-            },
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
           '500': {
             description: 'Internal server error',
-            content: {
-              'application/json': {
-                schema: { $ref: '#/components/schemas/Error' },
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+          },
+        },
+      },
+    },
+    '/v1/extract/batch': {
+      post: {
+        summary: 'Batch extract readable content from multiple URLs',
+        description:
+          'Accepts up to 5 URLs and returns an array of extracted results. ' +
+          'Per-URL errors are included inline — the overall request still returns 200. ' +
+          'Requires an x402 micropayment of **$0.005 USDC** on Base mainnet.',
+        operationId: 'extractBatch',
+        security: [{ x402Payment: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  urls:   { type: 'array', items: { type: 'string', format: 'uri' }, maxItems: 5, description: 'Array of URLs to extract (max 5)' },
+                  format: { type: 'string', enum: ['markdown', 'text'], default: 'markdown', description: 'Output format for all URLs' },
+                },
+                required: ['urls'],
+              },
+              example: {
+                urls: ['https://example.com/article1', 'https://example.com/article2'],
+                format: 'markdown',
               },
             },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'Array of extraction results (may include per-URL errors)',
+            headers: {
+              'X-RateLimit-Limit': { description: 'Request limit per window', schema: { type: 'integer', example: 20 } },
+              'X-RateLimit-Remaining': { description: 'Requests remaining in window', schema: { type: 'integer', example: 19 } },
+            },
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    results: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          title:             { type: 'string', nullable: true },
+                          byline:            { type: 'string', nullable: true },
+                          url:               { type: 'string' },
+                          content:           { type: 'string', nullable: true },
+                          length:            { type: 'integer' },
+                          word_count:        { type: 'integer' },
+                          extraction_method: { type: 'string', enum: ['crawl4ai', 'readability'] },
+                          lang:              { type: 'string' },
+                          error:             { type: 'string', description: 'Set only when this URL failed', nullable: true },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '400': {
+            description: 'Bad request — missing urls or too many URLs (max 5)',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+          },
+          '402': {
+            description: 'Payment required ($0.005 USDC on Base mainnet)',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+          },
+          '500': {
+            description: 'Internal server error',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
           },
         },
       },
@@ -1450,6 +1685,14 @@ const x402Manifest = {
       caip2Network: 'eip155:8453',
       asset: 'USDC',
       description: 'Extract clean, LLM-ready markdown from any URL.',
+    },
+    {
+      path: '/v1/extract/batch',
+      method: 'POST',
+      network: 'base',
+      caip2Network: 'eip155:8453',
+      asset: 'USDC',
+      description: 'Batch extract clean, LLM-ready markdown from up to 5 URLs.',
     },
   ],
 }
