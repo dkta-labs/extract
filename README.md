@@ -1,6 +1,6 @@
 # Extract
 
-Web content extraction API with MCP support. Converts any URL to clean, readable markdown — $0.001 per extraction via [x402](https://x402.org). No accounts, no API keys.
+Web content extraction API. Converts any URL to clean, readable markdown — $0.001 per extraction via [x402](https://x402.org). No accounts, no API keys.
 
 **[extract.dkta.dev](https://extract.dkta.dev)**
 
@@ -28,10 +28,6 @@ See [x402.org](https://x402.org) for how to generate payment headers programmati
 **Parameters:**
 - `url` (required) — the URL to extract
 - `format` (optional, default `markdown`) — output format
-
-## MCP Support
-
-Extract is available as an MCP tool. Point your MCP client at `https://extract.dkta.dev` to use it directly from Claude, Cursor, or any MCP-compatible agent host.
 
 ## Discovery
 
