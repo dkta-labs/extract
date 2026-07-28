@@ -42,5 +42,4 @@ Extract is available as an MCP tool. Point your MCP client at `https://extract.d
 
 ## Related
 
-- [engram](https://github.com/dkta0/engram) — shared memory API, same x402 pattern
 - [x402](https://x402.org) — the payment protocol
