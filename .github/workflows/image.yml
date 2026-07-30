@@ -52,7 +52,15 @@ jobs:
           exit 1
 
       - name: Publish verified image
-        run: docker push "ghcr.io/dkta-labs/extract:sha-${{ github.sha }}"
+        id: push
+        env:
+          IMAGE: ghcr.io/dkta-labs/extract:sha-${{ github.sha }}
+        run: |
+          output=$(docker push "$IMAGE")
+          echo "$output"
+          digest=$(echo "$output" | sed -n 's/^.*digest: \(sha256:[0-9a-f]\{64\}\).*$/\1/p' | tail -n 1)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Record immutable digest
-        run: echo "ghcr.io/dkta-labs/extract@${{ steps.build.outputs.digest }}"
+        run: echo "ghcr.io/dkta-labs/extract@${{ steps.push.outputs.digest }}"
