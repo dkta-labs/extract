@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 export const REQUEST_LOG_MAX_BYTES = 10 * 1024 * 1024
-export const REQUEST_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+export const REQUEST_LOG_RETENTION_MS = 167 * 60 * 60 * 1000
 export const REQUEST_LOG_MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000
 
 const TARGET_HOSTNAME_FIELDS = [
@@ -20,20 +20,33 @@ function stripExpiredHostnameFieldsFromContents(contents, cutoff) {
   if (endsWithNewline) lines.pop()
 
   let stripped = 0
+  let dropped = 0
   for (const [index, line] of lines.entries()) {
     let entry
     try {
       entry = JSON.parse(line)
     } catch {
-      throw new Error(`malformed JSONL at line ${index + 1}`)
+      lines[index] = null
+      dropped += 1
+      continue
     }
 
-    const timestamp = typeof entry?.ts === 'string' ? Date.parse(entry.ts) : Number.NaN
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      lines[index] = null
+      dropped += 1
+      continue
+    }
+    const hasHostname = TARGET_HOSTNAME_FIELDS.some(field => Object.hasOwn(entry, field))
+    const timestamp = typeof entry.ts === 'string' ? Date.parse(entry.ts) : Number.NaN
     if (!Number.isFinite(timestamp)) {
-      throw new Error(`invalid timestamp at line ${index + 1}`)
+      if (hasHostname) {
+        lines[index] = null
+        dropped += 1
+      }
+      continue
     }
 
-    if (timestamp >= cutoff) continue
+    if (timestamp > cutoff) continue
 
     let changed = false
     for (const field of TARGET_HOSTNAME_FIELDS) {
@@ -48,9 +61,11 @@ function stripExpiredHostnameFieldsFromContents(contents, cutoff) {
     }
   }
 
+  const retainedLines = lines.filter(line => line !== null)
   return {
-    contents: `${lines.join('\n')}${endsWithNewline ? '\n' : ''}`,
+    contents: `${retainedLines.join('\n')}${endsWithNewline && retainedLines.length > 0 ? '\n' : ''}`,
     stripped,
+    dropped,
   }
 }
 
@@ -87,20 +102,23 @@ export function stripExpiredHostnameFieldsFromFile(filePath, now = Date.now()) {
     stat = fs.statSync(filePath)
     contents = fs.readFileSync(filePath, 'utf8')
   } catch (error) {
-    if (error.code === 'ENOENT') return { stripped: 0, missing: true }
+    if (error.code === 'ENOENT') return { stripped: 0, dropped: 0, missing: true }
     throw error
   }
 
-  if (contents === '') return { stripped: 0, missing: false }
+  if (contents === '') return { stripped: 0, dropped: 0, missing: false }
 
   const result = stripExpiredHostnameFieldsFromContents(
     contents,
     now - REQUEST_LOG_RETENTION_MS
   )
-  if (result.stripped > 0) {
+  if (result.stripped > 0 || result.dropped > 0) {
     replaceFileAtomically(filePath, result.contents, stat.mode & 0o777)
   }
-  return { stripped: result.stripped, missing: false }
+  if (result.dropped > 0) {
+    console.warn(`request log dropped ${result.dropped} unageable record(s) from ${path.basename(filePath)}`)
+  }
+  return { stripped: result.stripped, dropped: result.dropped, missing: false }
 }
 
 export function stripExpiredHostnameFields(logPath, now = Date.now()) {

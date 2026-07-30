@@ -116,14 +116,15 @@ test('strips only old hostname fields at startup across active and rotated logs'
   const active = await entries(logPath)
   const rotated = await entries(`${logPath}.1`)
   const expectedActiveOld = withoutTargetHostnames(activeOld)
+  const expectedActiveBoundary = withoutTargetHostnames(activeBoundary)
   const expectedRotatedOld = withoutTargetHostnames(rotatedOld)
 
-  assert.equal(REQUEST_LOG_RETENTION_MS, 7 * 24 * 60 * 60 * 1000)
+  assert.equal(REQUEST_LOG_RETENTION_MS, 167 * 60 * 60 * 1000)
   assert.equal(REQUEST_LOG_MAINTENANCE_INTERVAL_MS, 60 * 60 * 1000)
   assert.equal(active.length, 3)
   assert.equal(rotated.length, 2)
   assert.deepEqual(active[0], expectedActiveOld)
-  assert.deepEqual(active[1], activeBoundary)
+  assert.deepEqual(active[1], expectedActiveBoundary)
   assert.deepEqual(active[2], activeRecent)
   assert.deepEqual(rotated[0], expectedRotatedOld)
   assert.deepEqual(rotated[1], rotatedRecent)
@@ -171,7 +172,7 @@ test('periodically strips old hostnames without removing request records', async
   })
 })
 
-test('leaves a malformed file untouched while processing the other log', async t => {
+test('drops unageable records while retaining safe request evidence', async t => {
   const logPath = await temporaryLog(t)
   const cases = [
     '{not-json}',
@@ -179,34 +180,43 @@ test('leaves a malformed file untouched while processing the other log', async t
   ]
 
   for (const [index, malformed] of cases.entries()) {
-    const original = [
-      line(logEntry(CUTOFF - 1, `old-${index}`, { target_hostname: 'must-stay-on-failure.example' })),
-      malformed,
-      line(logEntry(NOW, `recent-${index}`, { target_hostname: 'recent.example' })),
-    ].join('\n') + '\n'
+    const old = logEntry(CUTOFF - 1, `old-${index}`, {
+      target_hostname: 'strip-from-old.example',
+    })
+    const recent = logEntry(NOW, `recent-${index}`, {
+      target_hostname: 'recent.example',
+    })
+    const safeUnageable = {
+      event: 'payment_challenge',
+      request_id: `safe-unageable-${index}`,
+      endpoint: '/v1/extract',
+    }
     const rotatedOld = logEntry(CUTOFF - 1, `rotated-old-${index}`, {
       target_hostname: 'strip-from-valid-file.example',
       target_outcome_1: 'failure',
     })
-    await writeFile(logPath, original)
+    await writeFile(logPath, [line(old), malformed, line(safeUnageable), line(recent)].join('\n') + '\n')
     await writeFile(`${logPath}.1`, `${line(rotatedOld)}\n`)
 
     const warnings = []
     const originalWarn = console.warn
     console.warn = message => warnings.push(message)
     try {
-      assert.equal(stripExpiredHostnameFields(logPath, NOW), false)
+      assert.equal(stripExpiredHostnameFields(logPath, NOW), true)
     } finally {
       console.warn = originalWarn
     }
 
-    assert.equal(await readFile(logPath, 'utf8'), original)
+    assert.deepEqual(
+      await entries(logPath),
+      [withoutTargetHostnames(old), safeUnageable, recent]
+    )
     assert.deepEqual(
       await entries(`${logPath}.1`),
       [withoutTargetHostnames(rotatedOld)]
     )
     assert.equal(warnings.length, 1)
-    assert.match(warnings[0], /request log hostname retention failed for requests\.jsonl/)
+    assert.match(warnings[0], /dropped 1 unageable record.*requests\.jsonl/)
   }
 })
 
