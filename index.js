@@ -610,7 +610,7 @@ const openApiSpec = {
   openapi: '3.0.3',
   info: {
     title: 'extract.dkta.dev',
-    version: '1.2.3',
+    version: '1.2.4',
     description:
       'Clean content extraction for AI agents. A single request costs **$0.001 USDC** ' +
       'and a batch of up to 5 URLs costs **$0.005 USDC** on Base mainnet via the ' +

@@ -1,6 +1,7 @@
 [Unit]
 Description=extract.dkta.dev — x402 content extraction API
 Requires=extract-egress-firewall.service
+PartOf=extract-egress-firewall.service
 After=network.target extract-egress-firewall.service
 
 [Service]
