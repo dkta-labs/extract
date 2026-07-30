@@ -20,6 +20,8 @@ let facilitatorServer
 let facilitatorUrl
 let crawlerServer
 let crawlerUrl
+let targetServer
+let targetPort
 let app
 let baseUrl
 let workDir
@@ -127,10 +129,25 @@ before(async () => {
   const facilitatorAddress = await listen(facilitatorServer)
   facilitatorUrl = `http://127.0.0.1:${facilitatorAddress.port}`
 
-  crawlerServer = createServer((_req, res) => sendJson(res, 200, {
-    markdown: '# Paid extraction\n\nDeterministic integration content.',
-    metadata: { title: 'Paid extraction' },
-  }))
+  targetServer = createServer(req => req.socket.destroy())
+  const targetAddress = await listen(targetServer)
+  targetPort = targetAddress.port
+
+  crawlerServer = createServer((req, res) => {
+    let raw = ''
+    req.setEncoding('utf8')
+    req.on('data', chunk => { raw += chunk })
+    req.on('end', () => {
+      const { url } = JSON.parse(raw)
+      if (new URL(url).port === String(targetPort)) {
+        return sendJson(res, 200, { markdown: '' })
+      }
+      return sendJson(res, 200, {
+        markdown: '# Paid extraction\n\nDeterministic integration content.',
+        metadata: { title: 'Paid extraction' },
+      })
+    })
+  })
   const crawlerAddress = await listen(crawlerServer)
   crawlerUrl = `http://127.0.0.1:${crawlerAddress.port}/md`
 
@@ -140,7 +157,7 @@ before(async () => {
   baseUrl = `http://127.0.0.1:${appAddress.port}`
   workDir = await mkdtemp(path.join(tmpdir(), 'extract-test-'))
 
-  app = spawn(process.execPath, ['index.js'], {
+  app = spawn(process.execPath, ['--import', './test/local-public-target.mjs', 'index.js'], {
     cwd: ROOT,
     env: {
       ...process.env,
@@ -151,6 +168,7 @@ before(async () => {
       UMAMI_URL: analyticsUrl,
       FACILITATOR_URL: facilitatorUrl,
       CRAWL4AI_URL: crawlerUrl,
+      TEST_PUBLIC_TARGET_PORT: String(targetPort),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -181,6 +199,7 @@ after(async () => {
   if (analyticsServer) await close(analyticsServer)
   if (facilitatorServer) await close(facilitatorServer)
   if (crawlerServer) await close(crawlerServer)
+  if (targetServer) await close(targetServer)
   if (workDir) await rm(workDir, { recursive: true, force: true })
 })
 
@@ -371,6 +390,50 @@ test('records a normalized single hostname without URL secrets', async () => {
     'duration_ms', 'endpoint', 'event', 'format', 'length', 'request_id', 'target_hostname', 'ts',
   ])
   assert.equal(logged.target_hostname, 'example.com')
+
+  const telemetry = JSON.stringify({ analytics, logged })
+  for (const secret of secrets) assert.doesNotMatch(telemetry, new RegExp(secret))
+})
+
+test('records a paid single failure hostname without URL secrets', async () => {
+  const requestId = 'f6be8e83-6ea1-4e3d-a4c7-f019f1e99df6'
+  const secrets = ['failure-path-secret', 'failure-query-secret', 'failure-fragment-secret']
+  const target = `http://EXAMPLE.COM:${targetPort}/${secrets[0]}?token=${secrets[1]}#${secrets[2]}`
+  const response = await fetch(`${baseUrl}/v1/extract?url=${encodeURIComponent(target)}&format=text`, {
+    headers: {
+      'X-Request-ID': requestId,
+      'X-PAYMENT': paymentHeader('0x06'),
+    },
+  })
+  assert.equal(response.status, 500)
+  await response.json()
+  await waitForEvent('payment-authorized', requestId)
+
+  const analytics = (await waitForEvent('extract-request', requestId)).body.payload.data
+  assert.deepEqual(Object.keys(analytics).sort(), [
+    'duration_ms', 'format', 'reason', 'request_id', 'status', 'target_hostname',
+  ])
+  assert.equal(analytics.target_hostname, 'example.com')
+  assert.equal(analytics.request_id, requestId)
+  assert.equal(analytics.status, 500)
+  assert.equal(analytics.reason, 'internal_error')
+  assert.equal(analytics.format, 'text')
+  assert.equal(typeof analytics.duration_ms, 'number')
+
+  const entries = (await readFile(path.join(workDir, 'requests.jsonl'), 'utf8'))
+    .trim().split('\n').map(line => JSON.parse(line))
+  const logged = entries.find(entry => entry.event === 'failure' && entry.request_id === requestId)
+  assert.ok(logged)
+  assert.deepEqual(Object.keys(logged).sort(), [
+    'duration_ms', 'endpoint', 'event', 'format', 'reason', 'request_id', 'status',
+    'target_hostname', 'ts',
+  ])
+  assert.equal(logged.target_hostname, analytics.target_hostname)
+  assert.equal(logged.endpoint, '/v1/extract')
+  assert.equal(logged.status, analytics.status)
+  assert.equal(logged.reason, analytics.reason)
+  assert.equal(logged.format, analytics.format)
+  assert.equal(typeof logged.duration_ms, 'number')
 
   const telemetry = JSON.stringify({ analytics, logged })
   for (const secret of secrets) assert.doesNotMatch(telemetry, new RegExp(secret))

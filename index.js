@@ -185,6 +185,20 @@ function targetHostname(targetUrl) {
   return targetUrl.hostname.replace(/^\[|\]$/g, '').toLowerCase()
 }
 
+function recordSingleFailure(req, format, ts, start, status, reason) {
+  const endpoint = '/v1/extract'
+  const event = {
+    request_id: req.requestId,
+    target_hostname: targetHostname(req.targetUrl),
+    status,
+    format,
+    duration_ms: Date.now() - start,
+    reason,
+  }
+  logRequest({ ts, event: 'failure', endpoint, ...event })
+  void umamiEvent('extract-request', event, endpoint)
+}
+
 function batchTargetTelemetry(targetUrls, results) {
   const telemetry = {}
   for (let index = 0; index < targetUrls.length; index += 1) {
@@ -478,7 +492,7 @@ app.get('/v1/extract', async (req, res) => {
       })
 
       if (!response.ok) {
-        void umamiEvent('extract-request', { request_id: req.requestId, status: 502, reason: 'upstream_error' }, '/v1/extract')
+        recordSingleFailure(req, format, ts, start, 502, 'upstream_error')
         return res.status(502).json({ error: `upstream returned ${response.status}` })
       }
 
@@ -488,7 +502,7 @@ app.get('/v1/extract', async (req, res) => {
       const article = reader.parse()
 
       if (!article) {
-        void umamiEvent('extract-request', { request_id: req.requestId, status: 422, reason: 'not_readable' }, '/v1/extract')
+        recordSingleFailure(req, format, ts, start, 422, 'not_readable')
         return res.status(422).json({ error: 'could not extract readable content from url' })
       }
 
@@ -522,7 +536,7 @@ app.get('/v1/extract', async (req, res) => {
     void umamiEvent('extract-request', { request_id: req.requestId, status: 200, target_hostname, format, length: content.length, duration_ms }, '/v1/extract')
     return res.json(result)
   } catch (err) {
-    void umamiEvent('extract-request', { request_id: req.requestId, status: 500, reason: 'internal_error' }, '/v1/extract')
+    recordSingleFailure(req, format, ts, start, 500, 'internal_error')
     return res.status(500).json({ error: err.message })
   }
 })
