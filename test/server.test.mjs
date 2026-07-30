@@ -1,0 +1,354 @@
+import test, { after, before } from 'node:test'
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import express from 'express'
+import { paymentMiddleware } from 'x402-express'
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const PAYMENT_ADDRESS = '0x9C924E0b95FBE2Fe69D6ecDb434AEBFa15E236b2'
+const PAYER_ADDRESS = '0x1111111111111111111111111111111111111111'
+const SETTLEMENT_TRANSACTION = `0x${'2'.repeat(64)}`
+
+let analyticsServer
+let analyticsUrl
+let facilitatorServer
+let facilitatorUrl
+let crawlerServer
+let crawlerUrl
+let app
+let baseUrl
+let workDir
+const analyticsEvents = []
+const facilitatorCalls = []
+
+function listen(server) {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => resolve(server.address()))
+  })
+}
+
+function close(server) {
+  return new Promise(resolve => server.close(resolve))
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(body))
+}
+
+function paymentHeader(signature = '0x01') {
+  return Buffer.from(JSON.stringify({
+    x402Version: 1,
+    scheme: 'exact',
+    network: 'base',
+    payload: {
+      signature,
+      authorization: {
+        from: PAYER_ADDRESS,
+        to: PAYMENT_ADDRESS,
+        value: '1000',
+        validAfter: '0',
+        validBefore: '9999999999',
+        nonce: `0x${'0'.repeat(64)}`,
+      },
+    },
+  })).toString('base64')
+}
+
+async function waitForEvent(name, requestId) {
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline) {
+    const match = analyticsEvents.find(event =>
+      event.body?.payload?.name === name && event.body?.payload?.data?.request_id === requestId
+    )
+    if (match) return match
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`analytics event ${name} for ${requestId} was not received`)
+}
+
+before(async () => {
+  analyticsServer = createServer((req, res) => {
+    let raw = ''
+    req.setEncoding('utf8')
+    req.on('data', chunk => { raw += chunk })
+    req.on('end', () => {
+      analyticsEvents.push({
+        body: JSON.parse(raw),
+        userAgent: req.headers['user-agent'],
+      })
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({
+        cache: 'test',
+        sessionId: '00000000-0000-4000-8000-000000000000',
+        visitId: '00000000-0000-4000-8000-000000000001',
+      }))
+    })
+  })
+  const analyticsAddress = await listen(analyticsServer)
+  analyticsUrl = `http://127.0.0.1:${analyticsAddress.port}/api/send`
+
+  facilitatorServer = createServer((req, res) => {
+    let raw = ''
+    req.setEncoding('utf8')
+    req.on('data', chunk => { raw += chunk })
+    req.on('end', () => {
+      const body = raw ? JSON.parse(raw) : null
+      facilitatorCalls.push({ path: req.url, body })
+      if (req.url === '/verify') {
+        return sendJson(res, 200, { isValid: true, payer: PAYER_ADDRESS })
+      }
+      if (req.url === '/settle') {
+        if (body.paymentPayload.payload.signature === '0xdead') {
+          return sendJson(res, 200, {
+            success: false,
+            errorReason: 'invalid_payment',
+            payer: PAYER_ADDRESS,
+            transaction: '',
+            network: 'base',
+          })
+        }
+        return sendJson(res, 200, {
+          success: true,
+          payer: PAYER_ADDRESS,
+          transaction: SETTLEMENT_TRANSACTION,
+          network: 'base',
+        })
+      }
+      return sendJson(res, 404, { error: 'not found' })
+    })
+  })
+  const facilitatorAddress = await listen(facilitatorServer)
+  facilitatorUrl = `http://127.0.0.1:${facilitatorAddress.port}`
+
+  crawlerServer = createServer((_req, res) => sendJson(res, 200, {
+    markdown: '# Paid extraction\n\nDeterministic integration content.',
+    metadata: { title: 'Paid extraction' },
+  }))
+  const crawlerAddress = await listen(crawlerServer)
+  crawlerUrl = `http://127.0.0.1:${crawlerAddress.port}/md`
+
+  const portProbe = createServer()
+  const appAddress = await listen(portProbe)
+  await close(portProbe)
+  baseUrl = `http://127.0.0.1:${appAddress.port}`
+  workDir = await mkdtemp(path.join(tmpdir(), 'extract-test-'))
+
+  app = spawn(process.execPath, ['index.js'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(appAddress.port),
+      PAYMENT_ADDRESS,
+      NETWORK: 'base',
+      LOG_PATH: path.join(workDir, 'requests.jsonl'),
+      UMAMI_URL: analyticsUrl,
+      FACILITATOR_URL: facilitatorUrl,
+      CRAWL4AI_URL: crawlerUrl,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  await new Promise((resolve, reject) => {
+    let output = ''
+    const timer = setTimeout(() => reject(new Error(`server readiness timed out: ${output}`)), 10000)
+    app.stdout.on('data', chunk => {
+      output += chunk
+      if (output.includes('extract API running')) {
+        clearTimeout(timer)
+        resolve()
+      }
+    })
+    app.stderr.on('data', chunk => { output += chunk })
+    app.once('exit', code => {
+      clearTimeout(timer)
+      reject(new Error(`server exited before readiness with code ${code}: ${output}`))
+    })
+  })
+})
+
+after(async () => {
+  if (app && app.exitCode === null) {
+    app.kill('SIGTERM')
+    await new Promise(resolve => app.once('exit', resolve))
+  }
+  if (analyticsServer) await close(analyticsServer)
+  if (facilitatorServer) await close(facilitatorServer)
+  if (crawlerServer) await close(crawlerServer)
+  if (workDir) await rm(workDir, { recursive: true, force: true })
+})
+
+test('serves healthy discovery and truthful public contracts', async () => {
+  const health = await fetch(`${baseUrl}/health`)
+  assert.equal(health.status, 200)
+  assert.deepEqual(await health.json(), { ok: true })
+
+  for (const route of ['/logo.svg', '/sitemap.xml', '/robots.txt', '/docs']) {
+    const response = await fetch(`${baseUrl}${route}`)
+    assert.equal(response.status, 200, route)
+  }
+
+  const landing = await (await fetch(baseUrl)).text()
+  assert.match(landing, /word_count/)
+  assert.doesNotMatch(landing, /charged_usdc/)
+  assert.doesNotMatch(landing, /Payment settles before extraction/)
+  assert.match(landing, /Single-request 4xx\/5xx failures are not settled/)
+
+  const spec = await (await fetch(`${baseUrl}/openapi.json`)).json()
+  assert.equal(spec.info.version, '1.2.0')
+  assert.equal(spec.components.securitySchemes.x402Payment.description.includes(PAYMENT_ADDRESS), true)
+  assert.equal(JSON.stringify(spec).includes('X-RateLimit-Limit'), false)
+  assert.equal(spec.paths['/v1/extract'].get.parameters.at(-1).schema.format, 'uuid')
+  assert.equal(spec.paths['/v1/extract/batch'].post.parameters[0].schema.format, 'uuid')
+  assert.equal(spec.paths['/v1/extract'].get.responses['402'].headers['X-Request-ID'].schema.format, 'uuid')
+  assert.equal(spec.paths['/v1/extract/batch'].post.responses['402'].headers['X-Request-ID'].schema.format, 'uuid')
+  assert.equal(spec.paths['/v1/extract'].get.responses['200'].headers['X-PAYMENT-RESPONSE'].schema.type, 'string')
+  assert.equal(spec.paths['/v1/extract/batch'].post.responses['200'].headers['X-PAYMENT-RESPONSE'].schema.type, 'string')
+  assert.deepEqual(
+    spec.paths['/v1/extract'].get.responses['200'].content['application/json'].schema.required,
+    ['title', 'byline', 'url', 'content', 'length', 'word_count', 'extraction_method', 'lang']
+  )
+})
+
+test('rejects invalid and non-public targets before payment', async t => {
+  const cases = [
+    ['/v1/extract', 'url must be a string'],
+    ['/v1/extract?url=file%3A%2F%2F%2Fetc%2Fpasswd', 'url must use http or https'],
+    ['/v1/extract?url=http%3A%2F%2Flocalhost', 'not publicly routable'],
+    ['/v1/extract?url=http%3A%2F%2F127.0.0.1', 'not publicly routable'],
+    ['/v1/extract?url=http%3A%2F%2F169.254.169.254', 'not publicly routable'],
+    ['/v1/extract?url=http%3A%2F%2F%5B%3A%3A1%5D', 'not publicly routable'],
+    ['/v1/extract?url=http%3A%2F%2F%5B%3A%3Affff%3A127.0.0.1%5D', 'not publicly routable'],
+    ['/v1/extract?url=http%3A%2F%2F%5Bfec0%3A%3A1%5D', 'not publicly routable'],
+  ]
+
+  for (const [route, message] of cases) {
+    await t.test(route, async () => {
+      const response = await fetch(`${baseUrl}${route}`)
+      assert.equal(response.status, 400)
+      assert.match((await response.json()).error, new RegExp(message))
+    })
+  }
+
+  const batch = await fetch(`${baseUrl}/v1/extract/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ urls: ['https://1.1.1.1', 'http://10.0.0.1'] }),
+  })
+  assert.equal(batch.status, 400)
+  assert.match((await batch.json()).error, /invalid url at index 1/)
+})
+
+test('returns priced challenges and echoes client attempt IDs', async () => {
+  const singleId = '63c9ea8f-b170-4fae-bf67-7dba572c18ba'
+  const single = await fetch(`${baseUrl}/v1/extract?url=https%3A%2F%2F1.1.1.1`, {
+    headers: { 'X-Request-ID': singleId },
+  })
+  assert.equal(single.status, 402)
+  assert.equal(single.headers.get('x-request-id'), singleId)
+  assert.equal(single.headers.get('cache-control'), 'private, no-store')
+  const singleChallenge = await single.json()
+  assert.equal(singleChallenge.accepts[0].maxAmountRequired, '1000')
+  assert.equal(singleChallenge.accepts[0].payTo, PAYMENT_ADDRESS)
+
+  const singleEvent = await waitForEvent('payment-challenge', singleId)
+  assert.match(singleEvent.userAgent, /ExtractAPI\/1\.0/)
+  assert.equal(singleEvent.body.payload.url, '/v1/extract')
+
+  const batchId = '0ebf078d-45cc-4e90-b369-adbf60f33aeb'
+  const batch = await fetch(`${baseUrl}/v1/extract/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Request-ID': batchId },
+    body: JSON.stringify({ urls: ['https://1.1.1.1'] }),
+  })
+  assert.equal(batch.status, 402)
+  assert.equal(batch.headers.get('x-request-id'), batchId)
+  const batchChallenge = await batch.json()
+  assert.equal(batchChallenge.accepts[0].maxAmountRequired, '5000')
+  await waitForEvent('payment-challenge', batchId)
+  const variantId = '72903f76-6f06-4ae5-a6a4-8cbcaa463ae0'
+  const routeVariant = await fetch(`${baseUrl}/V1/EXTRACT/?url=https%3A%2F%2F1.1.1.1`, {
+    headers: { 'X-Request-ID': variantId },
+  })
+  assert.equal(routeVariant.status, 402)
+  assert.equal(routeVariant.headers.get('x-request-id'), variantId)
+  assert.equal((await waitForEvent('payment-challenge', variantId)).body.payload.url, '/v1/extract')
+
+  const replaced = await fetch(`${baseUrl}/v1/extract?url=https%3A%2F%2F1.1.1.1`, {
+    headers: { 'X-Request-ID': 'not-a-uuid' },
+  })
+  const replacementId = replaced.headers.get('x-request-id')
+  assert.notEqual(replacementId, 'not-a-uuid')
+  assert.match(replacementId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+})
+
+test('tracks successful settlement and skips settlement for failed responses', async () => {
+  const successId = '614ce52b-b967-4c05-910c-c1ea8228004e'
+  const success = await fetch(`${baseUrl}/v1/extract?url=https%3A%2F%2F1.1.1.1`, {
+    headers: {
+      'X-Request-ID': successId,
+      'X-PAYMENT': paymentHeader(),
+    },
+  })
+  assert.equal(success.status, 200)
+  assert.match((await success.json()).content, /Deterministic integration content/)
+  const responseHeader = success.headers.get('x-payment-response')
+  assert.ok(responseHeader)
+  assert.equal(JSON.parse(Buffer.from(responseHeader, 'base64').toString()).success, true)
+  await waitForEvent('payment-authorized', successId)
+  await waitForEvent('payment-settled', successId)
+
+  const failedSettlementId = 'c3b67bbd-60f6-4db9-88d5-50686d421175'
+  const failedSettlement = await fetch(`${baseUrl}/v1/extract?url=https%3A%2F%2F1.1.1.1`, {
+    headers: {
+      'X-Request-ID': failedSettlementId,
+      'X-PAYMENT': paymentHeader('0xdead'),
+    },
+  })
+  assert.equal(failedSettlement.status, 402)
+  assert.equal(failedSettlement.headers.get('x-payment-response'), null)
+  await waitForEvent('payment-authorized', failedSettlementId)
+  await waitForEvent('payment-challenge', failedSettlementId)
+  assert.equal(analyticsEvents.some(event =>
+    event.body?.payload?.name === 'payment-settled' &&
+    event.body?.payload?.data?.request_id === failedSettlementId
+  ), false)
+
+  const failureApp = express()
+  failureApp.use(paymentMiddleware(
+    PAYMENT_ADDRESS,
+    { 'GET /failure': { price: '$0.001', network: 'base' } },
+    { url: facilitatorUrl }
+  ))
+  failureApp.get('/failure', (_req, res) => res.status(502).json({ error: 'upstream failed' }))
+  const failureServer = createServer(failureApp)
+  const failureAddress = await listen(failureServer)
+  const settlementsBeforeFailure = facilitatorCalls.filter(call => call.path === '/settle').length
+  try {
+    const failure = await fetch(`http://127.0.0.1:${failureAddress.port}/failure`, {
+      headers: { 'X-PAYMENT': paymentHeader('0x03') },
+    })
+    assert.equal(failure.status, 502)
+    assert.equal(failure.headers.get('x-payment-response'), null)
+    assert.equal(facilitatorCalls.filter(call => call.path === '/settle').length, settlementsBeforeFailure)
+  } finally {
+    await close(failureServer)
+  }
+})
+
+test('keeps request logs free of target URLs and IP addresses', async () => {
+  const log = await readFile(path.join(workDir, 'requests.jsonl'), 'utf8')
+  const entries = log.trim().split('\n').map(line => JSON.parse(line))
+  assert.equal(entries.length > 0, true)
+  for (const entry of entries) {
+    assert.equal('url' in entry, false)
+    assert.equal('ip' in entry, false)
+  }
+  assert.doesNotMatch(log, /1\.1\.1\.1/)
+})

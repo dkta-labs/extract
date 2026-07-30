@@ -6,7 +6,7 @@
 
 ### GET /v1/extract?url=<url>&format=<markdown|text>
 
-Returns structured content extracted from any URL. Requires x402 micropayment of $0.001 USDC on Base mainnet in the X-PAYMENT header.
+Returns structured content extracted from a public HTTP(S) URL. Requires x402 micropayment of $0.001 USDC on Base mainnet in the X-PAYMENT header.
 
 **Response:**
 
@@ -23,11 +23,10 @@ Returns structured content extracted from any URL. Requires x402 micropayment of
 }
 ```
 
-**Response headers:** `X-RateLimit-Limit: 20`, `X-RateLimit-Remaining: 19`
 
 ### POST /v1/extract/batch
 
-Batch extract from up to 5 URLs in a single request. Requires x402 micropayment of $0.005 USDC on Base mainnet.
+Batch extract 1 to 5 URLs for a flat x402 micropayment of $0.005 USDC on Base mainnet.
 
 **Request body:**
 
@@ -61,9 +60,7 @@ Batch extract from up to 5 URLs in a single request. Requires x402 micropayment 
 }
 ```
 
-Per-URL errors are returned inline — the overall response is still 200. Max 5 URLs per request.
-
-**Response headers:** `X-RateLimit-Limit: 20`, `X-RateLimit-Remaining: 19`
+The batch returns HTTP 200 and settles the flat payment even when per-URL upstream or extraction errors are included inline. Invalid request shape or target URLs are rejected before payment with HTTP 400.
 
 ## Response fields
 
@@ -79,29 +76,38 @@ Per-URL errors are returned inline — the overall response is still 200. Max 5 
 
 ## Payment
 
-Use an x402-compatible client (e.g. x402-fetch npm package) with a USDC wallet on Base mainnet.
+Use an x402-compatible client (for example, the `x402-fetch` npm package) with a USDC wallet on Base mainnet. Send the same client-generated UUID as `X-Request-ID` on the initial request and automatic paid retry to correlate authorization, extraction, and settlement.
 
 ```js
-import { wrapWithPaymentClientFetch } from 'x402-fetch'
-const fetch = wrapWithPaymentClientFetch(globalThis.fetch, walletClient)
+import { randomUUID } from 'node:crypto'
+import { wrapFetchWithPayment } from 'x402-fetch'
+const paidFetch = wrapFetchWithPayment(globalThis.fetch, walletClient)
 
 // Single extraction — $0.001 USDC
-const res = await fetch('https://extract.dkta.dev/v1/extract?url=https://example.com')
+const res = await paidFetch('https://extract.dkta.dev/v1/extract?url=https://example.com', {
+  headers: { 'X-Request-ID': randomUUID() },
+})
 const { title, content, word_count, extraction_method, lang } = await res.json()
 
 // Batch extraction — $0.005 USDC
-const batchRes = await fetch('https://extract.dkta.dev/v1/extract/batch', {
+const batchRes = await paidFetch('https://extract.dkta.dev/v1/extract/batch', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: { 'Content-Type': 'application/json', 'X-Request-ID': randomUUID() },
   body: JSON.stringify({ urls: ['https://example.com', 'https://example.org'] }),
 })
 const { results } = await batchRes.json()
 ```
 
+## Validation and billing
+
+- Request shape, format, URL scheme, credentials, DNS resolution, and direct private/link-local targets are checked before the payment challenge.
+- A single extraction settles only after a successful response; a 4xx/5xx single-extraction response is not settled. A batch settles on its HTTP 200 response, including when individual results contain inline errors.
+- A public URL that redirects or resolves differently later still requires network-level egress controls; callers should not treat application validation as a complete sandbox.
+
 ## Pricing
 
 - Single extraction: $0.001 USDC per request
-- Batch extraction (up to 5 URLs): $0.005 USDC per request
+- Batch extraction (1 to 5 URLs): $0.005 USDC flat per request
 
 ## Docs
 - OpenAPI spec: https://extract.dkta.dev/openapi.json
