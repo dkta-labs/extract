@@ -119,7 +119,7 @@ test('strips only old hostname fields at startup across active and rotated logs'
   const expectedActiveBoundary = withoutTargetHostnames(activeBoundary)
   const expectedRotatedOld = withoutTargetHostnames(rotatedOld)
 
-  assert.equal(REQUEST_LOG_RETENTION_MS, 167 * 60 * 60 * 1000)
+  assert.equal(REQUEST_LOG_RETENTION_MS, 166 * 60 * 60 * 1000)
   assert.equal(REQUEST_LOG_MAINTENANCE_INTERVAL_MS, 60 * 60 * 1000)
   assert.equal(active.length, 3)
   assert.equal(rotated.length, 2)

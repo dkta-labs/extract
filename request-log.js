@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 export const REQUEST_LOG_MAX_BYTES = 10 * 1024 * 1024
-export const REQUEST_LOG_RETENTION_MS = 167 * 60 * 60 * 1000
+export const REQUEST_LOG_RETENTION_MS = 166 * 60 * 60 * 1000
 export const REQUEST_LOG_MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000
 
 const TARGET_HOSTNAME_FIELDS = [
