@@ -201,7 +201,7 @@ test('serves healthy discovery and truthful public contracts', async () => {
   assert.match(landing, /Single-request 4xx\/5xx failures are not settled/)
 
   const spec = await (await fetch(`${baseUrl}/openapi.json`)).json()
-  assert.equal(spec.info.version, '1.2.1')
+  assert.equal(spec.info.version, '1.2.2')
   assert.equal(spec.components.securitySchemes.x402Payment.description.includes(PAYMENT_ADDRESS), true)
   assert.equal(JSON.stringify(spec).includes('X-RateLimit-Limit'), false)
   assert.equal(spec.paths['/v1/extract'].get.parameters.at(-1).schema.format, 'uuid')
@@ -258,7 +258,8 @@ test('returns priced challenges and echoes client attempt IDs', async () => {
   assert.equal(singleChallenge.accepts[0].payTo, PAYMENT_ADDRESS)
 
   const singleEvent = await waitForEvent('payment-challenge', singleId)
-  assert.match(singleEvent.userAgent, /ExtractAPI\/1\.0/)
+  assert.match(singleEvent.userAgent, /Chrome\/138/)
+  assert.equal(singleEvent.body.type, 'event')
   assert.equal(singleEvent.body.payload.url, '/v1/extract')
 
   const batchId = '0ebf078d-45cc-4e90-b369-adbf60f33aeb'

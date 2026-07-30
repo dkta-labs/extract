@@ -38,7 +38,7 @@ async function umamiEvent(name, data = {}, url = '/') {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (compatible; ExtractAPI/1.0; +https://extract.dkta.dev)',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
       },
       body: JSON.stringify({
         payload: {
@@ -594,7 +594,7 @@ const openApiSpec = {
   openapi: '3.0.3',
   info: {
     title: 'extract.dkta.dev',
-    version: '1.2.1',
+    version: '1.2.2',
     description:
       'Clean content extraction for AI agents. A single request costs **$0.001 USDC** ' +
       'and a batch of up to 5 URLs costs **$0.005 USDC** on Base mainnet via the ' +
