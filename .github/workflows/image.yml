@@ -39,7 +39,8 @@ jobs:
         env:
           IMAGE: ghcr.io/dkta-labs/extract:sha-${{ github.sha }}
         run: |
-          docker run --detach --name extract-oci --publish 127.0.0.1:3721:3721 "$IMAGE"
+          docker run --detach --name extract-oci --publish 127.0.0.1:3721:3721 \
+            --env PAYMENT_ADDRESS=0x0000000000000000000000000000000000000001 "$IMAGE"
           trap 'docker rm --force extract-oci' EXIT
           test "$(docker inspect --format '{{.Config.User}}' extract-oci)" = node
           for attempt in $(seq 1 30); do
