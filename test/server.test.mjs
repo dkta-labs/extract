@@ -20,6 +20,8 @@ let facilitatorServer
 let facilitatorUrl
 let crawlerServer
 let crawlerUrl
+let targetServer
+let targetPort
 let app
 let baseUrl
 let workDir
@@ -42,7 +44,7 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body))
 }
 
-function paymentHeader(signature = '0x01') {
+function paymentHeader(signature = '0x01', value = '1000') {
   return Buffer.from(JSON.stringify({
     x402Version: 1,
     scheme: 'exact',
@@ -52,7 +54,7 @@ function paymentHeader(signature = '0x01') {
       authorization: {
         from: PAYER_ADDRESS,
         to: PAYMENT_ADDRESS,
-        value: '1000',
+        value,
         validAfter: '0',
         validBefore: '9999999999',
         nonce: `0x${'0'.repeat(64)}`,
@@ -127,10 +129,25 @@ before(async () => {
   const facilitatorAddress = await listen(facilitatorServer)
   facilitatorUrl = `http://127.0.0.1:${facilitatorAddress.port}`
 
-  crawlerServer = createServer((_req, res) => sendJson(res, 200, {
-    markdown: '# Paid extraction\n\nDeterministic integration content.',
-    metadata: { title: 'Paid extraction' },
-  }))
+  targetServer = createServer(req => req.socket.destroy())
+  const targetAddress = await listen(targetServer)
+  targetPort = targetAddress.port
+
+  crawlerServer = createServer((req, res) => {
+    let raw = ''
+    req.setEncoding('utf8')
+    req.on('data', chunk => { raw += chunk })
+    req.on('end', () => {
+      const { url } = JSON.parse(raw)
+      if (new URL(url).port === String(targetPort)) {
+        return sendJson(res, 200, { markdown: '' })
+      }
+      return sendJson(res, 200, {
+        markdown: '# Paid extraction\n\nDeterministic integration content.',
+        metadata: { title: 'Paid extraction' },
+      })
+    })
+  })
   const crawlerAddress = await listen(crawlerServer)
   crawlerUrl = `http://127.0.0.1:${crawlerAddress.port}/md`
 
@@ -140,7 +157,7 @@ before(async () => {
   baseUrl = `http://127.0.0.1:${appAddress.port}`
   workDir = await mkdtemp(path.join(tmpdir(), 'extract-test-'))
 
-  app = spawn(process.execPath, ['index.js'], {
+  app = spawn(process.execPath, ['--import', './test/local-public-target.mjs', 'index.js'], {
     cwd: ROOT,
     env: {
       ...process.env,
@@ -151,6 +168,7 @@ before(async () => {
       UMAMI_URL: analyticsUrl,
       FACILITATOR_URL: facilitatorUrl,
       CRAWL4AI_URL: crawlerUrl,
+      TEST_PUBLIC_TARGET_PORT: String(targetPort),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -181,6 +199,7 @@ after(async () => {
   if (analyticsServer) await close(analyticsServer)
   if (facilitatorServer) await close(facilitatorServer)
   if (crawlerServer) await close(crawlerServer)
+  if (targetServer) await close(targetServer)
   if (workDir) await rm(workDir, { recursive: true, force: true })
 })
 
@@ -343,7 +362,140 @@ test('tracks successful settlement and skips settlement for failed responses', a
   }
 })
 
-test('keeps request logs free of target URLs and IP addresses', async () => {
+test('records a normalized single hostname without URL secrets', async () => {
+  const requestId = '4456d5b9-b4ad-46cc-8d84-7a0c5e526489'
+  const secrets = ['single-path-secret', 'single-query-secret', 'single-fragment-secret']
+  const target = `https://EXAMPLE.COM/${secrets[0]}?token=${secrets[1]}#${secrets[2]}`
+  const response = await fetch(`${baseUrl}/v1/extract?url=${encodeURIComponent(target)}&format=text`, {
+    headers: {
+      'X-Request-ID': requestId,
+      'X-PAYMENT': paymentHeader('0x04'),
+    },
+  })
+  assert.equal(response.status, 200)
+  await response.json()
+
+  const analytics = (await waitForEvent('extract-request', requestId)).body.payload.data
+  assert.deepEqual(Object.keys(analytics).sort(), [
+    'duration_ms', 'format', 'length', 'request_id', 'status', 'target_hostname',
+  ])
+  assert.equal(analytics.target_hostname, 'example.com')
+  assert.equal(analytics.request_id, requestId)
+
+  const entries = (await readFile(path.join(workDir, 'requests.jsonl'), 'utf8'))
+    .trim().split('\n').map(line => JSON.parse(line))
+  const logged = entries.find(entry => entry.event === 'success' && entry.request_id === requestId)
+  assert.ok(logged)
+  assert.deepEqual(Object.keys(logged).sort(), [
+    'duration_ms', 'endpoint', 'event', 'format', 'length', 'request_id', 'target_hostname', 'ts',
+  ])
+  assert.equal(logged.target_hostname, 'example.com')
+
+  const telemetry = JSON.stringify({ analytics, logged })
+  for (const secret of secrets) assert.doesNotMatch(telemetry, new RegExp(secret))
+})
+
+test('records a paid single failure hostname without URL secrets', async () => {
+  const requestId = 'f6be8e83-6ea1-4e3d-a4c7-f019f1e99df6'
+  const secrets = ['failure-path-secret', 'failure-query-secret', 'failure-fragment-secret']
+  const target = `http://EXAMPLE.COM:${targetPort}/${secrets[0]}?token=${secrets[1]}#${secrets[2]}`
+  const response = await fetch(`${baseUrl}/v1/extract?url=${encodeURIComponent(target)}&format=text`, {
+    headers: {
+      'X-Request-ID': requestId,
+      'X-PAYMENT': paymentHeader('0x06'),
+    },
+  })
+  assert.equal(response.status, 500)
+  await response.json()
+  await waitForEvent('payment-authorized', requestId)
+
+  const analytics = (await waitForEvent('extract-request', requestId)).body.payload.data
+  assert.deepEqual(Object.keys(analytics).sort(), [
+    'duration_ms', 'format', 'reason', 'request_id', 'status', 'target_hostname',
+  ])
+  assert.equal(analytics.target_hostname, 'example.com')
+  assert.equal(analytics.request_id, requestId)
+  assert.equal(analytics.status, 500)
+  assert.equal(analytics.reason, 'internal_error')
+  assert.equal(analytics.format, 'text')
+  assert.equal(typeof analytics.duration_ms, 'number')
+
+  const entries = (await readFile(path.join(workDir, 'requests.jsonl'), 'utf8'))
+    .trim().split('\n').map(line => JSON.parse(line))
+  const logged = entries.find(entry => entry.event === 'failure' && entry.request_id === requestId)
+  assert.ok(logged)
+  assert.deepEqual(Object.keys(logged).sort(), [
+    'duration_ms', 'endpoint', 'event', 'format', 'reason', 'request_id', 'status',
+    'target_hostname', 'ts',
+  ])
+  assert.equal(logged.target_hostname, analytics.target_hostname)
+  assert.equal(logged.endpoint, '/v1/extract')
+  assert.equal(logged.status, analytics.status)
+  assert.equal(logged.reason, analytics.reason)
+  assert.equal(logged.format, analytics.format)
+  assert.equal(typeof logged.duration_ms, 'number')
+
+  const telemetry = JSON.stringify({ analytics, logged })
+  for (const secret of secrets) assert.doesNotMatch(telemetry, new RegExp(secret))
+})
+
+test('records bounded batch hostnames aligned with outcomes without URL secrets', async () => {
+  const requestId = '7dc79fbe-9f9b-40e5-9db1-f021445dfb7e'
+  const secrets = [
+    'batch-path-one-secret',
+    'batch-query-one-secret',
+    'batch-fragment-one-secret',
+    'batch-path-two-secret',
+    'batch-query-two-secret',
+    'batch-fragment-two-secret',
+  ]
+  const targets = [
+    `https://EXAMPLE.COM/${secrets[0]}?token=${secrets[1]}#${secrets[2]}`,
+    `https://EXAMPLE.ORG/${secrets[3]}?token=${secrets[4]}#${secrets[5]}`,
+  ]
+  const response = await fetch(`${baseUrl}/v1/extract/batch`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Request-ID': requestId,
+      'X-PAYMENT': paymentHeader('0x05', '5000'),
+    },
+    body: JSON.stringify({ urls: targets, format: 'markdown' }),
+  })
+  assert.equal(response.status, 200)
+  assert.equal((await response.json()).results.length, 2)
+
+  const analytics = (await waitForEvent('extract-batch', requestId)).body.payload.data
+  assert.deepEqual(Object.keys(analytics).sort(), [
+    'count', 'duration_ms', 'failure_count', 'format', 'request_id', 'status',
+    'target_hostname_1', 'target_hostname_2', 'target_outcome_1', 'target_outcome_2',
+  ])
+  assert.deepEqual(
+    [analytics.target_hostname_1, analytics.target_outcome_1, analytics.target_hostname_2, analytics.target_outcome_2],
+    ['example.com', 'success', 'example.org', 'success']
+  )
+  assert.equal(Object.values(analytics).every(value => ['number', 'string'].includes(typeof value)), true)
+
+  const settlement = (await waitForEvent('payment-settled', requestId)).body.payload.data
+  assert.equal(settlement.endpoint, '/v1/extract/batch')
+  const entries = (await readFile(path.join(workDir, 'requests.jsonl'), 'utf8'))
+    .trim().split('\n').map(line => JSON.parse(line))
+  const logged = entries.find(entry => entry.event === 'success' && entry.request_id === requestId)
+  assert.ok(logged)
+  assert.deepEqual(Object.keys(logged).sort(), [
+    'count', 'duration_ms', 'endpoint', 'event', 'failure_count', 'format', 'request_id',
+    'target_hostname_1', 'target_hostname_2', 'target_outcome_1', 'target_outcome_2', 'ts',
+  ])
+  assert.deepEqual(
+    [logged.target_hostname_1, logged.target_outcome_1, logged.target_hostname_2, logged.target_outcome_2],
+    ['example.com', 'success', 'example.org', 'success']
+  )
+
+  const telemetry = JSON.stringify({ analytics, logged, settlement })
+  for (const secret of secrets) assert.doesNotMatch(telemetry, new RegExp(secret))
+})
+
+test('keeps request logs free of full target URLs and client IP fields', async () => {
   const log = await readFile(path.join(workDir, 'requests.jsonl'), 'utf8')
   const entries = log.trim().split('\n').map(line => JSON.parse(line))
   assert.equal(entries.length > 0, true)
@@ -351,5 +503,5 @@ test('keeps request logs free of target URLs and IP addresses', async () => {
     assert.equal('url' in entry, false)
     assert.equal('ip' in entry, false)
   }
-  assert.doesNotMatch(log, /1\.1\.1\.1/)
+  assert.doesNotMatch(log, /https?:\/\//)
 })
