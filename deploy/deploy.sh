@@ -5,4 +5,9 @@
 set -euo pipefail
 
 npm ci --omit=dev
+sudo install -o root -g root -m 0644 extract.service /etc/systemd/system/extract.service
+sudo install -o root -g root -m 0644 extract-egress-firewall.service /etc/systemd/system/extract-egress-firewall.service
+sudo systemctl daemon-reload
+sudo systemctl enable extract-egress-firewall.service
+sudo systemctl restart extract-egress-firewall.service
 sudo systemctl restart extract

@@ -1,0 +1,15 @@
+[Unit]
+Description=Restrict Crawl4AI egress to public IPv4 destinations
+Requires=docker.service
+PartOf=docker.service
+After=docker.service
+Before=extract.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/extract/deploy/egress-firewall.sh apply
+ExecReload=/bin/bash /opt/extract/deploy/egress-firewall.sh apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target docker.service

@@ -71,7 +71,7 @@ The response is `{ "results": [...] }`. Each successful item has the same fields
 
 Inputs are validated before the x402 challenge. A single extraction settles only after a successful response; a 4xx/5xx single-extraction response is not settled. A batch settles on its HTTP 200 response, including when individual results contain inline errors. Send a client-generated UUID as `X-Request-ID` on the initial request and paid retry to correlate authorization, extraction, and settlement.
 
-Direct local, private, link-local, credential-bearing, non-HTTP(S), and unresolvable targets are rejected before payment. Network egress controls remain the authoritative defense against DNS rebinding or a public target that changes behavior after validation.
+Direct local, private, link-local, credential-bearing, non-HTTP(S), and unresolvable targets are rejected before payment. Readability fetches pin a validated public address on every redirect hop, and the Crawl4AI worker is restricted from private and non-routable destinations at the host firewall.
 
 ## Discovery
 

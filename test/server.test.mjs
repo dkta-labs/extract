@@ -201,7 +201,7 @@ test('serves healthy discovery and truthful public contracts', async () => {
   assert.match(landing, /Single-request 4xx\/5xx failures are not settled/)
 
   const spec = await (await fetch(`${baseUrl}/openapi.json`)).json()
-  assert.equal(spec.info.version, '1.2.2')
+  assert.equal(spec.info.version, '1.2.3')
   assert.equal(spec.components.securitySchemes.x402Payment.description.includes(PAYMENT_ADDRESS), true)
   assert.equal(JSON.stringify(spec).includes('X-RateLimit-Limit'), false)
   assert.equal(spec.paths['/v1/extract'].get.parameters.at(-1).schema.format, 'uuid')

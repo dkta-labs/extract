@@ -8,6 +8,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
+import { Agent as HttpAgent } from 'node:http'
+import { Agent as HttpsAgent } from 'node:https'
 import { BlockList, isIP } from 'node:net'
 
 const LOG_PATH = process.env.LOG_PATH || '/opt/extract/logs/requests.jsonl'
@@ -140,7 +142,7 @@ function isBlockedAddress(address, family) {
   return blockedAddresses.check(normalized, family === 6 ? 'ipv6' : 'ipv4')
 }
 
-async function validateTargetUrl(value) {
+async function resolveTargetUrl(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 2048) {
     throw new Error('url must be a string between 1 and 2048 characters')
   }
@@ -178,7 +180,11 @@ async function validateTargetUrl(value) {
     throw new Error('url hostname is not publicly routable')
   }
 
-  return targetUrl
+  return { targetUrl, addresses }
+}
+
+async function validateTargetUrl(value) {
+  return (await resolveTargetUrl(value)).targetUrl
 }
 
 async function fetchPublicUrl(initialUrl, options = {}, timeoutMs = 10000) {
@@ -186,9 +192,18 @@ async function fetchPublicUrl(initialUrl, options = {}, timeoutMs = 10000) {
   let targetUrl = initialUrl
 
   for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
-    targetUrl = await validateTargetUrl(targetUrl.toString())
+    const resolved = await resolveTargetUrl(targetUrl.toString())
+    targetUrl = resolved.targetUrl
+    const selected = resolved.addresses.find(({ family }) => family === 4) || resolved.addresses[0]
+    const pinnedLookup = (_hostname, lookupOptions, callback) => lookupOptions?.all
+      ? callback(null, [selected])
+      : callback(null, selected.address, selected.family)
+    const agent = targetUrl.protocol === 'https:'
+      ? new HttpsAgent({ lookup: pinnedLookup })
+      : new HttpAgent({ lookup: pinnedLookup })
     const response = await fetch(targetUrl, {
       ...options,
+      agent,
       redirect: 'manual',
       signal,
     })
@@ -196,6 +211,7 @@ async function fetchPublicUrl(initialUrl, options = {}, timeoutMs = 10000) {
     if (![301, 302, 303, 307, 308].includes(response.status)) return response
 
     const location = response.headers.get('location')
+    response.body?.destroy()
     if (!location) throw new Error('upstream redirect is missing a location')
     targetUrl = new URL(location, targetUrl)
   }
@@ -594,7 +610,7 @@ const openApiSpec = {
   openapi: '3.0.3',
   info: {
     title: 'extract.dkta.dev',
-    version: '1.2.2',
+    version: '1.2.3',
     description:
       'Clean content extraction for AI agents. A single request costs **$0.001 USDC** ' +
       'and a batch of up to 5 URLs costs **$0.005 USDC** on Base mainnet via the ' +

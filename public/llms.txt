@@ -102,7 +102,7 @@ const { results } = await batchRes.json()
 
 - Request shape, format, URL scheme, credentials, DNS resolution, and direct private/link-local targets are checked before the payment challenge.
 - A single extraction settles only after a successful response; a 4xx/5xx single-extraction response is not settled. A batch settles on its HTTP 200 response, including when individual results contain inline errors.
-- A public URL that redirects or resolves differently later still requires network-level egress controls; callers should not treat application validation as a complete sandbox.
+- Readability fetches pin a validated public address on every redirect hop. The Crawl4AI worker is independently restricted from private and non-routable destinations at the host firewall.
 
 ## Pricing
 
