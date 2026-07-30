@@ -151,10 +151,13 @@ export function rotateRequestLog(logPath) {
 export function startRequestLogMaintenance(logPath, options = {}) {
   const now = options.now || Date.now
   const intervalMs = options.intervalMs || REQUEST_LOG_MAINTENANCE_INTERVAL_MS
-  const startupSucceeded = stripExpiredHostnameFields(logPath, now())
-  if (startupSucceeded) rotateRequestLog(logPath)
+  const maintain = () => {
+    const succeeded = stripExpiredHostnameFields(logPath, now())
+    if (succeeded) rotateRequestLog(logPath)
+  }
+  maintain()
 
-  const timer = setInterval(() => stripExpiredHostnameFields(logPath, now()), intervalMs)
+  const timer = setInterval(maintain, intervalMs)
   timer.unref()
   return timer
 }

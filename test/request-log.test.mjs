@@ -269,3 +269,28 @@ test('retains the ten-mebibyte startup rotation bound', async t => {
   await assert.rejects(stat(logPath), { code: 'ENOENT' })
   assert.equal((await stat(`${logPath}.1`)).size, Buffer.byteLength(oversized))
 })
+
+test('retains the ten-mebibyte periodic rotation bound', async t => {
+  const logPath = await temporaryLog(t)
+  await writeFile(logPath, `${line(logEntry(NOW, 'startup-small'))}\n`)
+  const timer = startRequestLogMaintenance(logPath, {
+    now: () => NOW,
+    intervalMs: 20,
+  })
+  t.after(() => clearInterval(timer))
+
+  const oversized = `${line(logEntry(NOW, 'periodic-oversized', {
+    padding: 'x'.repeat(REQUEST_LOG_MAX_BYTES),
+  }))}\n`
+  await writeFile(logPath, oversized)
+
+  await waitFor(async () => {
+    try {
+      const rotated = await stat(`${logPath}.1`)
+      await assert.rejects(stat(logPath), { code: 'ENOENT' })
+      return rotated.size === Buffer.byteLength(oversized)
+    } catch {
+      return false
+    }
+  })
+})
