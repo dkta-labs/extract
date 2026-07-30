@@ -11,17 +11,11 @@ import { lookup } from 'node:dns/promises'
 import { Agent as HttpAgent } from 'node:http'
 import { Agent as HttpsAgent } from 'node:https'
 import { BlockList, isIP } from 'node:net'
+import { startRequestLogMaintenance } from './request-log.js'
 
 const LOG_PATH = process.env.LOG_PATH || '/srv/dkta/extract/logs/requests.jsonl'
 
-// Log rotation: if log file exceeds 10MB, rotate it
-try {
-  const stat = fs.statSync(LOG_PATH)
-  if (stat.size > 10 * 1024 * 1024) {
-    fs.renameSync(LOG_PATH, LOG_PATH + '.1')
-    console.log('Log rotated: requests.jsonl -> requests.jsonl.1')
-  }
-} catch (_) { /* file may not exist yet */ }
+startRequestLogMaintenance(LOG_PATH)
 
 function logRequest(entry) {
   try {
