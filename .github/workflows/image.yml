@@ -23,19 +23,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish immutable image
+      - name: Build immutable image
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          load: true
           tags: ghcr.io/dkta-labs/extract:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      - name: Smoke test published image
+      - name: Smoke test image before publication
         env:
           IMAGE: ghcr.io/dkta-labs/extract:sha-${{ github.sha }}
         run: |
@@ -50,6 +50,9 @@ jobs:
           done
           docker logs extract-oci
           exit 1
+
+      - name: Publish verified image
+        run: docker push "ghcr.io/dkta-labs/extract:sha-${{ github.sha }}"
 
       - name: Record immutable digest
         run: echo "ghcr.io/dkta-labs/extract@${{ steps.build.outputs.digest }}"
