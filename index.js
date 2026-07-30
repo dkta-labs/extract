@@ -12,7 +12,7 @@ import { Agent as HttpAgent } from 'node:http'
 import { Agent as HttpsAgent } from 'node:https'
 import { BlockList, isIP } from 'node:net'
 
-const LOG_PATH = process.env.LOG_PATH || '/opt/extract/logs/requests.jsonl'
+const LOG_PATH = process.env.LOG_PATH || '/srv/dkta/extract/logs/requests.jsonl'
 
 // Log rotation: if log file exceeds 10MB, rotate it
 try {
