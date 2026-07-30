@@ -187,6 +187,20 @@ async function validateTargetUrl(value) {
   return (await resolveTargetUrl(value)).targetUrl
 }
 
+function targetHostname(targetUrl) {
+  return targetUrl.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+}
+
+function batchTargetTelemetry(targetUrls, results) {
+  const telemetry = {}
+  for (let index = 0; index < targetUrls.length; index += 1) {
+    const slot = index + 1
+    telemetry[`target_hostname_${slot}`] = targetHostname(targetUrls[index])
+    telemetry[`target_outcome_${slot}`] = results[index].error ? 'failure' : 'success'
+  }
+  return telemetry
+}
+
 async function fetchPublicUrl(initialUrl, options = {}, timeoutMs = 10000) {
   const signal = AbortSignal.timeout(timeoutMs)
   let targetUrl = initialUrl
@@ -509,8 +523,9 @@ app.get('/v1/extract', async (req, res) => {
       lang,
     }
     const duration_ms = Date.now() - start
-    logRequest({ ts, event: 'success', request_id: req.requestId, endpoint: '/v1/extract', length: content.length, format, duration_ms })
-    void umamiEvent('extract-request', { request_id: req.requestId, status: 200, format, length: content.length, duration_ms }, '/v1/extract')
+    const target_hostname = targetHostname(targetUrl)
+    logRequest({ ts, event: 'success', request_id: req.requestId, endpoint: '/v1/extract', target_hostname, length: content.length, format, duration_ms })
+    void umamiEvent('extract-request', { request_id: req.requestId, status: 200, target_hostname, format, length: content.length, duration_ms }, '/v1/extract')
     return res.json(result)
   } catch (err) {
     void umamiEvent('extract-request', { request_id: req.requestId, status: 500, reason: 'internal_error' }, '/v1/extract')
@@ -596,8 +611,9 @@ app.post('/v1/extract/batch', async (req, res) => {
     const results = await Promise.all(urls.map(extractOne))
     const duration_ms = Date.now() - start
     const failure_count = results.filter(result => result.error).length
-    logRequest({ ts, event: 'success', request_id: req.requestId, endpoint: '/v1/extract/batch', count: urls.length, failure_count, format, duration_ms })
-    void umamiEvent('extract-batch', { request_id: req.requestId, status: 200, format, count: urls.length, failure_count, duration_ms }, '/v1/extract/batch')
+    const targetTelemetry = batchTargetTelemetry(urls, results)
+    logRequest({ ts, event: 'success', request_id: req.requestId, endpoint: '/v1/extract/batch', count: urls.length, failure_count, format, duration_ms, ...targetTelemetry })
+    void umamiEvent('extract-batch', { request_id: req.requestId, status: 200, format, count: urls.length, failure_count, duration_ms, ...targetTelemetry }, '/v1/extract/batch')
     return res.json({ results })
   } catch (err) {
     void umamiEvent('extract-batch', { request_id: req.requestId, status: 500, reason: 'internal_error' }, '/v1/extract/batch')
