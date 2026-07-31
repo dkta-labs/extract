@@ -1,7 +1,9 @@
 import { createWalletClient, http, publicActions } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { base } from 'viem/chains'
-import { createPaymentHeader, selectPaymentRequirements } from 'x402/client'
+import { x402Client } from '@x402/core/client'
+import { registerExactEvmScheme } from '@x402/evm/exact/client'
+import { wrapFetchWithPayment } from '@x402/fetch'
 
 const PRIVATE_KEY = process.env.TEST_PRIVATE_KEY
 if (!PRIVATE_KEY) { console.error('TEST_PRIVATE_KEY required'); process.exit(1) }
@@ -19,6 +21,10 @@ async function main() {
     transport: http('https://mainnet.base.org'),
   }).extend(publicActions)
 
+  const client = new x402Client()
+  registerExactEvmScheme(client, { signer: account })
+  const paidFetch = wrapFetchWithPayment(globalThis.fetch, client)
+
   // Check USDC balance
   const usdc = await walletClient.readContract({
     address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
@@ -34,34 +40,30 @@ async function main() {
   console.log('   Status:', r1.status)
   if (r1.status !== 402) { console.error('Expected 402, got', r1.status); process.exit(1) }
 
-  const body402 = await r1.json()
-  console.log('   x402Version:', body402.x402Version)
-  console.log('   payTo:', body402.accepts?.[0]?.payTo)
-  console.log('   amount:', body402.accepts?.[0]?.maxAmountRequired, 'µUSDC')
+  const encodedChallenge = r1.headers.get('payment-required')
+  if (!encodedChallenge) { console.error('Missing PAYMENT-REQUIRED header'); process.exit(1) }
+  const challenge = JSON.parse(Buffer.from(encodedChallenge, 'base64').toString())
+  console.log('   x402Version:', challenge.x402Version)
+  console.log('   payTo:', challenge.accepts?.[0]?.payTo)
+  console.log('   amount:', challenge.accepts?.[0]?.amount, 'µUSDC')
+  console.log('   network:', challenge.accepts?.[0]?.network)
 
-  // Step 2: build payment header
-  console.log('\n2. Signing payment...')
-  const selected = selectPaymentRequirements(body402.accepts, 'exact', 'base')
-  const paymentHeader = await createPaymentHeader(walletClient, 1, selected)
-  console.log('   Payment header built ✓')
+  // Step 2: pay and retry automatically
+  console.log('\n2. Signing payment and retrying...')
 
-  // Step 3: retry with payment
-  console.log('\n3. Retrying with X-PAYMENT header...')
-  const r2 = await fetch(`${API}?url=${encodeURIComponent(TEST_URL)}`, {
-    headers: { 'X-PAYMENT': paymentHeader },
-  })
+  const r2 = await paidFetch(`${API}?url=${encodeURIComponent(TEST_URL)}`)
   console.log('   Status:', r2.status)
 
   if (r2.status === 200) {
     const data = await r2.json()
-    console.log('\n✅ SUCCESS')
+    console.log('\nSUCCESS')
     console.log('   Title:', data.title)
     console.log('   Byline:', data.byline || '(none)')
     console.log('   Length:', data.length, 'chars')
-    console.log('   Preview:', data.text?.slice(0, 150) + '...')
+    console.log('   Preview:', data.content?.slice(0, 150) + '...')
   } else {
     const err = await r2.text()
-    console.error('\n❌ FAILED:', r2.status, err)
+    console.error('\nFAILED:', r2.status, err)
     process.exit(1)
   }
 }

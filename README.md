@@ -6,6 +6,8 @@ Web content extraction API for AI agents. Converts public HTTP(S) URLs to struct
 
 ## Usage
 
+Extract uses x402 v2 on Base mainnet. A self-custodied EVM wallet with USDC can pay directly; Extract does not require an Extract account or API key.
+
 Verify the service and inspect the x402 challenge without paying:
 
 ```bash
@@ -13,11 +15,37 @@ curl "https://extract.dkta.dev/health"
 curl -i "https://extract.dkta.dev/v1/extract?url=https://example.com"
 ```
 
+For automatic payment and retry:
+
 ```bash
-# Extract one page ($0.001 USDC). Reuse X-Request-ID on the paid retry.
+npm install @x402/core @x402/evm @x402/fetch viem
+```
+
+```js
+import { x402Client } from "@x402/core/client";
+import { registerExactEvmScheme } from "@x402/evm/exact/client";
+import { wrapFetchWithPayment } from "@x402/fetch";
+import { privateKeyToAccount } from "viem/accounts";
+
+const client = new x402Client();
+registerExactEvmScheme(client, {
+  signer: privateKeyToAccount(process.env.EVM_PRIVATE_KEY),
+});
+const paidFetch = wrapFetchWithPayment(globalThis.fetch, client);
+
+const response = await paidFetch(
+  "https://extract.dkta.dev/v1/extract?url=https://example.com&format=markdown",
+  { headers: { "X-Request-ID": crypto.randomUUID() } },
+);
+console.log(await response.json());
+```
+
+To construct the payment yourself, decode `PAYMENT-REQUIRED` from the free HTTP 402 response, sign an accepted option, then retry:
+
+```bash
 curl "https://extract.dkta.dev/v1/extract?url=https://example.com&format=markdown" \
-  -H "X-Request-ID: <client-generated-uuid>" \
-  -H "X-PAYMENT: <x402-payment-header>"
+  -H "X-Request-ID: <same-client-generated-uuid>" \
+  -H "PAYMENT-SIGNATURE: <x402-v2-payment-signature>"
 ```
 
 Successful requests return JSON:
@@ -35,7 +63,7 @@ Successful requests return JSON:
 }
 ```
 
-See [x402.org](https://x402.org) for how to generate payment headers programmatically.
+See the [x402 buyer quickstart](https://docs.cdp.coinbase.com/x402/quickstart-for-buyers) for self-custodied and managed-wallet client options.
 
 ## API
 
@@ -78,6 +106,7 @@ Direct local, private, link-local, credential-bearing, non-HTTP(S), and unresolv
 - OpenAPI spec: `https://extract.dkta.dev/openapi.json`
 - LLM summary: `https://extract.dkta.dev/llms.txt`
 - x402 manifest: `https://extract.dkta.dev/.well-known/x402.json`
+- Bazaar metadata is embedded in each x402 v2 `PAYMENT-REQUIRED` challenge for machine-readable discovery.
 - Plugin manifest: `https://extract.dkta.dev/.well-known/ai-plugin.json`
 - Sitemap: `https://extract.dkta.dev/sitemap.xml`
 - Logo: `https://extract.dkta.dev/logo.svg`

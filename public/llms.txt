@@ -6,7 +6,7 @@
 
 ### GET /v1/extract?url=<url>&format=<markdown|text>
 
-Returns structured content extracted from a public HTTP(S) URL. Requires x402 micropayment of $0.001 USDC on Base mainnet in the X-PAYMENT header.
+Returns structured content extracted from a public HTTP(S) URL. Requires an x402 v2 micropayment of $0.001 USDC on Base mainnet in the `PAYMENT-SIGNATURE` header.
 
 **Response:**
 
@@ -76,12 +76,20 @@ The batch returns HTTP 200 and settles the flat payment even when per-URL upstre
 
 ## Payment
 
-Use an x402-compatible client (for example, the `x402-fetch` npm package) with a USDC wallet on Base mainnet. Send the same client-generated UUID as `X-Request-ID` on the initial request and automatic paid retry to correlate authorization, extraction, and settlement.
+Use an x402 v2 client with a self-custodied or managed USDC wallet on Base mainnet (`eip155:8453`). The free HTTP 402 response carries base64 payment requirements and Bazaar discovery metadata in `PAYMENT-REQUIRED`; clients retry with `PAYMENT-SIGNATURE`. Send the same client-generated UUID as `X-Request-ID` on the initial request and paid retry.
 
 ```js
 import { randomUUID } from 'node:crypto'
-import { wrapFetchWithPayment } from 'x402-fetch'
-const paidFetch = wrapFetchWithPayment(globalThis.fetch, walletClient)
+import { x402Client } from '@x402/core/client'
+import { registerExactEvmScheme } from '@x402/evm/exact/client'
+import { wrapFetchWithPayment } from '@x402/fetch'
+import { privateKeyToAccount } from 'viem/accounts'
+
+const client = new x402Client()
+registerExactEvmScheme(client, {
+  signer: privateKeyToAccount(process.env.EVM_PRIVATE_KEY),
+})
+const paidFetch = wrapFetchWithPayment(globalThis.fetch, client)
 
 // Single extraction — $0.001 USDC
 const res = await paidFetch('https://extract.dkta.dev/v1/extract?url=https://example.com', {
@@ -113,3 +121,5 @@ const { results } = await batchRes.json()
 - OpenAPI spec: https://extract.dkta.dev/openapi.json
 - Interactive docs: https://extract.dkta.dev/docs
 - x402 protocol: https://x402.org
+- x402 manifest: https://extract.dkta.dev/.well-known/x402.json
+- Bazaar metadata: embedded in each x402 v2 `PAYMENT-REQUIRED` challenge
