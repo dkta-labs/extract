@@ -87,7 +87,24 @@ curl "https://extract.dkta.dev/v1/credits/balance" \
   -H "Authorization: Bearer ext_live_..."
 ```
 
-Keep API keys out of URLs, logs, source control, and client-side applications. Failed single extractions release their reservation and cost no credits. A batch consumes 5,000 units on its HTTP 200 response, including when individual items contain inline errors.
+### Top up an existing key
+
+From the landing page, choose **Top up existing**, enter the current key on Extract's private top-up page, and continue to Stripe. Extract authenticates the key and gives Stripe only a random reference bound to that key. The key and its hash never appear in the Payment Link. Every successfully paid use of that checkout link credits the same existing key.
+
+CLI clients can create the same checkout:
+
+```bash
+TOPUP_URL=$(
+  curl -fsS -X POST "https://extract.dkta.dev/v1/credits/topups" \
+    -H "Authorization: Bearer $EXTRACT_API_KEY" |
+    jq -r .checkout_url
+)
+open "$TOPUP_URL" # use xdg-open on Linux
+```
+
+After payment, Stripe redirects to the success page, which confirms that the existing key was credited. The credential does not change. Call `GET /v1/credits/balance` with the same bearer key to verify the new balance.
+
+Keep API keys out of URLs, logs, source control, and client-side applications. Failed single extractions release their reservation and cost no credits. A batch consumes 5,000 units on its HTTP 200 response, including when individual items contain inline errors. Refunding a completely unspent package removes only that package's units. A refund after any of its units were spent, or a dispute, suspends the key for payment review without deleting unrelated grants.
 
 ## API
 
@@ -96,6 +113,7 @@ Keep API keys out of URLs, logs, source control, and client-side applications. F
 | GET | `/v1/extract?url=` | $0.001 | Extract one URL |
 | POST | `/v1/extract/batch` | $0.005 flat | Extract 1 to 5 URLs |
 | GET | `/v1/credits/checkout` | free | Get the $10 Stripe Payment Link |
+| POST | `/v1/credits/topups` | free | Create a $10 checkout for the authenticated existing key |
 | POST | `/v1/credits/claim` | free | Bind client-generated key material to a paid Checkout Session |
 | GET | `/v1/credits/balance` | free | Read prepaid balance with bearer authentication |
 | GET | `/health` | free | Health check |
@@ -161,7 +179,7 @@ Configure `https://extract.dkta.dev/v1/credits/stripe-webhook` for:
 - `charge.refunded`
 - `charge.dispute.created`
 
-Before deployment, retrieve the actual Payment Link in Stripe and verify its active status, fixed amount/currency, and `after_completion.redirect.url`; a matching URL in `STRIPE_PAYMENT_LINK_URL` alone does not prove the redirect is configured. The success page intentionally has `no-store`, `no-referrer`, and no third-party resources. It keeps the session ID and client-generated candidate in tab-scoped state until Copy succeeds, then clears both.
+Before deployment, retrieve the actual Payment Link in Stripe and verify its active status, fixed amount/currency, and `after_completion.redirect.url`; a matching URL in `STRIPE_PAYMENT_LINK_URL` alone does not prove the redirect is configured. The top-up and success pages intentionally have `no-store`, `no-referrer`, and no third-party resources. The top-up page sends the bearer key only to Extract. The success page stores a new-key candidate in tab-scoped state until Copy succeeds; an existing-key top-up creates no browser copy of the key.
 
 ## Related
 

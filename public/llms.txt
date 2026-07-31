@@ -108,11 +108,13 @@ const { results } = await batchRes.json()
 
 ## Prepaid API key
 
-`GET /v1/credits/checkout` returns a reusable Stripe Payment Link for the optional $10 package. It buys 10,000 single extractions, 2,000 batch requests, or any equivalent mix. The success page generates a 256-bit `ext_live_...` candidate locally and submits `{ "session_id": "...", "api_key": "ext_live_..." }` to `POST /v1/credits/claim`. Retry with the same candidate if the response is interrupted; the server stores only its hash. Use the accepted key as:
+`GET /v1/credits/checkout` returns a reusable Stripe Payment Link for a new-key purchase of the optional $10 package. It buys 10,000 single extractions, 2,000 batch requests, or any equivalent mix. The success page generates a 256-bit `ext_live_...` candidate locally and submits `{ "session_id": "...", "api_key": "ext_live_..." }` to `POST /v1/credits/claim`. Retry with the same candidate if the response is interrupted; the server stores only its hash. Use the accepted key as:
 
 ```http
 Authorization: Bearer ext_live_...
 ```
+
+To add the same package to an existing key, call `POST /v1/credits/topups` with that bearer authorization, then open the returned `checkout_url`. Extract authenticates the key and sends Stripe only a random `client_reference_id` bound to that key; neither the key nor its hash appears in the URL. Every successfully paid Checkout Session carrying that reference credits the same existing key.
 
 `GET /v1/credits/balance` returns the remaining integer credit units and equivalent request counts. Credits do not expire. Never place the key in a URL or client-side application.
 
