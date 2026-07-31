@@ -298,10 +298,14 @@ test('revokes claimed credits on refunds and preserves reversals delivered befor
   }
 })
 
-test('fails closed on partial prepaid configuration', () => {
+test('stays disabled with only a database path and fails closed on partial Stripe configuration', () => {
   assert.equal(createCreditService({}), null)
+  assert.equal(createCreditService({ CREDIT_DB_PATH: ':memory:' }), null)
   assert.throws(
-    () => createCreditService({ CREDIT_DB_PATH: ':memory:' }),
+    () => createCreditService({
+      CREDIT_DB_PATH: ':memory:',
+      STRIPE_PAYMENT_LINK_ID: 'plink_partial',
+    }),
     /prepaid credits require CREDIT_DB_PATH, STRIPE_PAYMENT_LINK_ID, STRIPE_PAYMENT_LINK_URL, and STRIPE_WEBHOOK_SECRET/
   )
 })
