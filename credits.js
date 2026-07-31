@@ -10,8 +10,6 @@ export const SINGLE_EXTRACTION_UNITS = 1_000
 export const BATCH_EXTRACTION_UNITS = 5_000
 
 const API_KEY_PATTERN = /^ext_live_[A-Za-z0-9_-]{43}$/
-const PENDING_ORDER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
-const FAILED_ORDER_RETENTION_MS = 48 * 60 * 60 * 1000
 const SESSION_ID_PATTERN = /^cs_(?:test_|live_)?[A-Za-z0-9_]{8,}$/
 
 export class CreditError extends Error {
@@ -68,10 +66,10 @@ export class CreditLedger {
 
       CREATE TABLE IF NOT EXISTS credit_orders (
         id TEXT PRIMARY KEY,
-        stripe_session_id TEXT UNIQUE,
-        stripe_payment_intent_id TEXT UNIQUE,
+        stripe_session_id TEXT NOT NULL UNIQUE,
+        stripe_payment_intent_id TEXT NOT NULL UNIQUE,
         units INTEGER NOT NULL CHECK (units > 0),
-        status TEXT NOT NULL CHECK (status IN ('pending', 'paid', 'claimed', 'failed', 'reversed')),
+        status TEXT NOT NULL CHECK (status IN ('paid', 'claimed', 'reversed')),
         api_key_id TEXT,
         reversal_reason TEXT,
         created_at TEXT NOT NULL,
@@ -112,7 +110,6 @@ export class CreditLedger {
       ) STRICT;
     `)
     this.releaseOrphanedReservations()
-    this.cleanupAbandonedOrders()
   }
 
   close() {
@@ -141,91 +138,6 @@ export class CreditLedger {
     })
   }
 
-  cleanupAbandonedOrders(
-    pendingCutoff = new Date(Date.now() - PENDING_ORDER_RETENTION_MS).toISOString(),
-    failedCutoff = new Date(Date.now() - FAILED_ORDER_RETENTION_MS).toISOString()
-  ) {
-    return this.database.prepare(`
-      DELETE FROM credit_orders
-      WHERE (status = 'pending' AND updated_at < ?)
-         OR (status = 'failed' AND updated_at < ?)
-    `).run(pendingCutoff, failedCutoff).changes
-  }
-
-  createOrder(units = CREDIT_PACKAGE_UNITS) {
-    const order = {
-      id: `ord_${randomUUID()}`,
-      units,
-      createdAt: now(),
-    }
-    this.database.prepare(`
-      INSERT INTO credit_orders (id, units, status, created_at, updated_at)
-      VALUES (?, ?, 'pending', ?, ?)
-    `).run(order.id, order.units, order.createdAt, order.createdAt)
-    return order
-  }
-
-  attachCheckoutSession(orderId, sessionId) {
-    const result = this.database.prepare(`
-      UPDATE credit_orders
-      SET stripe_session_id = ?, updated_at = ?
-      WHERE id = ? AND status = 'pending' AND stripe_session_id IS NULL
-    `).run(sessionId, now(), orderId)
-    if (result.changes !== 1) {
-      throw new CreditError('invalid_order_state', 'credit order cannot accept a Checkout Session', 409)
-    }
-  }
-
-  failOrder(orderId) {
-    this.database.prepare(`
-      UPDATE credit_orders SET status = 'failed', updated_at = ?
-      WHERE id = ? AND status = 'pending'
-    `).run(now(), orderId)
-  }
-
-  fulfillCheckout({ eventId, orderId, sessionId, paymentIntentId, units }) {
-    return transaction(this.database, () => {
-      const seen = this.database.prepare('SELECT 1 FROM stripe_events WHERE event_id = ?').get(eventId)
-      if (seen) return { duplicate: true }
-
-      const order = this.database.prepare('SELECT * FROM credit_orders WHERE id = ?').get(orderId)
-      if (
-        !order ||
-        order.stripe_session_id !== sessionId ||
-        order.units !== units ||
-        (order.stripe_payment_intent_id && order.stripe_payment_intent_id !== paymentIntentId)
-      ) {
-        throw new CreditError('checkout_mismatch', 'Checkout Session does not match a pending credit order', 400)
-      }
-      if (order.status === 'failed') {
-        throw new CreditError('order_failed', 'credit order is no longer fulfillable', 409)
-      }
-
-      this.database.prepare('INSERT INTO stripe_events (event_id, received_at) VALUES (?, ?)')
-        .run(eventId, now())
-      const reversal = this.database.prepare(`
-        SELECT reason FROM payment_reversals WHERE payment_intent_id = ?
-      `).get(paymentIntentId)
-      if (order.status === 'pending') {
-        this.database.prepare(`
-          UPDATE credit_orders
-          SET status = ?, stripe_payment_intent_id = ?, reversal_reason = ?, updated_at = ?
-          WHERE id = ?
-        `).run(
-          reversal ? 'reversed' : 'paid',
-          paymentIntentId,
-          reversal?.reason || null,
-          now(),
-          orderId
-        )
-      }
-      return {
-        duplicate: false,
-        alreadyFulfilled: order.status !== 'pending',
-        reversed: order.status === 'reversed' || Boolean(reversal),
-      }
-    })
-  }
 
   fulfillPaymentLinkCheckout({ eventId, sessionId, paymentIntentId, units }) {
     return transaction(this.database, () => {
@@ -340,17 +252,15 @@ export class CreditLedger {
 
     const preflight = findOrder()
     const preflightState = claimState(preflight, keyHash)
-    if (preflightState === 'pending') return { pending: true }
     if (preflightState === 'claimed') {
-      return { pending: false, alreadyClaimed: true, balanceUnits: preflight.balance_units }
+      return { alreadyClaimed: true, balanceUnits: preflight.balance_units }
     }
 
     return transaction(this.database, () => {
       const order = findOrder()
       const state = claimState(order, keyHash)
-      if (state === 'pending') return { pending: true }
       if (state === 'claimed') {
-        return { pending: false, alreadyClaimed: true, balanceUnits: order.balance_units }
+        return { alreadyClaimed: true, balanceUnits: order.balance_units }
       }
 
       const apiKeyId = randomUUID()
@@ -374,7 +284,6 @@ export class CreditLedger {
       `).run(apiKeyId, timestamp, order.id)
 
       return {
-        pending: false,
         alreadyClaimed: false,
         balanceUnits: order.units,
       }

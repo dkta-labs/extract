@@ -368,10 +368,6 @@ app.post('/v1/credits/claim', express.json({ limit: '2kb' }), (req, res) => {
     const apiKey = req.body?.api_key
     const claim = creditService.ledger.claimCheckout(req.body?.session_id, apiKey)
     res.setHeader('Cache-Control', 'private, no-store')
-    if (claim.pending) {
-      res.setHeader('Retry-After', '2')
-      return res.status(202).json({ status: 'pending' })
-    }
     if (!claim.alreadyClaimed) {
       logRequest({
         ts: new Date().toISOString(),
@@ -1216,7 +1212,6 @@ const openApiSpec = {
               },
             },
           },
-          '202': { description: 'Stripe webhook fulfillment is still pending' },
           '404': { description: 'The paid Checkout Session is not available yet or was reversed' },
           '409': { description: 'The Checkout Session was already claimed with different key material' },
         },
@@ -1519,7 +1514,7 @@ app.get('/credits/success', (_req, res) => {
         const body = await response.json();
         if (
           attempt < 30 &&
-          (response.status === 202 || (response.status === 404 && body.code === 'checkout_not_found'))
+          response.status === 404 && body.code === 'checkout_not_found'
         ) {
           status.textContent = 'Payment received. Preparing your API key…';
           setTimeout(() => claim(attempt + 1), 2000);
