@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
+import { JSDOM } from 'jsdom'
 import { paymentMiddleware, x402ResourceServer } from '@x402/express'
 import { HTTPFacilitatorClient } from '@x402/core/server'
 import { registerExactEvmScheme } from '@x402/evm/exact/server'
@@ -239,6 +240,8 @@ test('serves healthy discovery and truthful public contracts', async () => {
   assert.doesNotMatch(landing, /charged_usdc/)
   assert.doesNotMatch(landing, /Payment settles before extraction/)
   assert.match(landing, /Single-request 4xx\/5xx failures are not settled/)
+  const javascriptExample = new JSDOM(landing).window.document.querySelector('#pane-js').textContent
+  assert.match(javascriptExample, /globalThis\.crypto\.randomUUID\(\)/)
 
   const spec = await (await fetch(`${baseUrl}/openapi.json`)).json()
   assert.equal(spec.info.version, '2.0.0')
