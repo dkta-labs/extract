@@ -1,5 +1,11 @@
 import express from 'express'
-import { paymentMiddleware } from 'x402-express'
+import { paymentMiddleware, x402ResourceServer } from '@x402/express'
+import { HTTPFacilitatorClient } from '@x402/core/server'
+import { registerExactEvmScheme } from '@x402/evm/exact/server'
+import {
+  bazaarResourceServerExtension,
+  declareDiscoveryExtension,
+} from '@x402/extensions/bazaar'
 import { createCdpAuthHeaders } from '@coinbase/x402'
 import { Readability } from '@mozilla/readability'
 import { JSDOM } from 'jsdom'
@@ -63,13 +69,14 @@ const app = express()
 app.set('trust proxy', true) // Cloudflare + Caddy sit in front
 const PORT = process.env.PORT || 3721
 const PAYMENT_ADDRESS = process.env.PAYMENT_ADDRESS
-const NETWORK = process.env.NETWORK || 'base'
+const NETWORK = process.env.NETWORK || 'eip155:8453'
+const PUBLIC_URL = process.env.PUBLIC_URL || 'https://extract.dkta.dev'
 
 if (!PAYMENT_ADDRESS || !/^0x[0-9a-fA-F]{40}$/.test(PAYMENT_ADDRESS)) {
   throw new Error('PAYMENT_ADDRESS must be set to a valid EVM address')
 }
-if (NETWORK !== 'base') {
-  throw new Error('NETWORK must be base')
+if (NETWORK !== 'eip155:8453') {
+  throw new Error('NETWORK must be eip155:8453')
 }
 
 const blockedAddresses = new BlockList()
@@ -246,8 +253,8 @@ async function fetchPublicUrl(initialUrl, options = {}, timeoutMs = 10000) {
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'content-type, x-payment, payment-signature, x-payment-signature, x-request-id, authorization',
-  'Access-Control-Expose-Headers': 'x-payment-response, www-authenticate, x-request-id',
+  'Access-Control-Allow-Headers': 'content-type, payment-signature, x-request-id, authorization',
+  'Access-Control-Expose-Headers': 'payment-required, payment-response, x-request-id',
 }
 
 function applyCors(res) {
@@ -270,6 +277,15 @@ app.use(['/v1/extract', '/v1/extract/batch', '/.well-known/x402', '/.well-known/
   next()
 })
 
+function isSuccessfulSettlementHeader(value) {
+  if (!value) return false
+  try {
+    return JSON.parse(Buffer.from(String(value), 'base64').toString()).success === true
+  } catch {
+    return false
+  }
+}
+
 app.use(['/v1/extract', '/v1/extract/batch'], (req, res, next) => {
   if (!requestEndpoint(req)) return next()
   const suppliedRequestId = req.get('x-request-id')
@@ -279,7 +295,7 @@ app.use(['/v1/extract', '/v1/extract/batch'], (req, res, next) => {
   res.setHeader('X-Request-ID', req.requestId)
   const endpoint = requestEndpoint(req)
   res.once('finish', () => {
-    if (!res.getHeader('X-PAYMENT-RESPONSE')) return
+    if (!isSuccessfulSettlementHeader(res.getHeader('PAYMENT-RESPONSE'))) return
     const event = { request_id: req.requestId, endpoint, method: req.method }
     logRequest({ ts: new Date().toISOString(), event: 'payment_settled', ...event })
     void umamiEvent('payment-settled', event, endpoint)
@@ -288,7 +304,7 @@ app.use(['/v1/extract', '/v1/extract/batch'], (req, res, next) => {
 })
 
 // Ensure 402 responses are never cached regardless of how paymentMiddleware sends them.
-// Hook writeHead so this fires even if x402-express uses res.send/res.end rather than res.json.
+// Hook writeHead so this fires even if the x402 middleware uses res.send/res.end rather than res.json.
 app.use(['/v1/extract', '/v1/extract/batch'], (req, res, next) => {
   const endpoint = requestEndpoint(req)
   let challengeTracked = false
@@ -374,55 +390,8 @@ app.post('/v1/extract/batch', async (req, res, next) => {
   next()
 })
 
-// x402 payment gate — $0.001 per extraction, $0.005 per batch
-app.use(paymentMiddleware(
-  PAYMENT_ADDRESS,
-  {
-    'GET /v1/extract': {
-      price: '$0.001',
-      network: NETWORK,
-      config: {
-        description: 'Extract clean markdown from a public HTTP(S) URL',
-        inputSchema: {
-          properties: {
-            url: { type: 'string', description: 'Fully-qualified URL to extract content from' },
-            format: { type: 'string', enum: ['markdown', 'text'], description: 'Output format' },
-          },
-          required: ['url'],
-        },
-        outputSchema: {
-          example: { title: 'Article Title', byline: null, url: 'https://example.com/article', content: '# Markdown...', length: 4821, word_count: 800, extraction_method: 'crawl4ai', lang: 'en' },
-          schema: {
-            properties: {
-              title: { type: 'string', nullable: true },
-              byline: { type: 'string', nullable: true },
-              url: { type: 'string' },
-              content: { type: 'string' },
-              length: { type: 'number' },
-              word_count: { type: 'number' },
-              extraction_method: { type: 'string', enum: ['crawl4ai', 'readability'] },
-              lang: { type: 'string' },
-            },
-            required: ['title', 'byline', 'url', 'content', 'length', 'word_count', 'extraction_method', 'lang'],
-          },
-        },
-      },
-    },
-    'POST /v1/extract/batch': {
-      price: '$0.005',
-      network: NETWORK,
-      config: {
-        description: 'Batch extract clean markdown from up to 5 URLs',
-        inputSchema: {
-          properties: {
-            urls: { type: 'array', items: { type: 'string' }, description: 'Array of URLs to extract (max 5)' },
-            format: { type: 'string', enum: ['markdown', 'text'], description: 'Output format' },
-          },
-          required: ['urls'],
-        },
-      },
-    },
-  },
+// x402 v2 payment gate — $0.001 per extraction, $0.005 per batch.
+const facilitatorClient = new HTTPFacilitatorClient(
   process.env.FACILITATOR_URL
     ? { url: process.env.FACILITATOR_URL }
     : {
@@ -430,8 +399,121 @@ app.use(paymentMiddleware(
         createAuthHeaders: createCdpAuthHeaders(
           process.env.CDP_API_KEY_ID,
           process.env.CDP_API_KEY_SECRET
-        )
+        ),
       }
+)
+const resourceServer = new x402ResourceServer(facilitatorClient)
+registerExactEvmScheme(resourceServer, { networks: [NETWORK] })
+resourceServer.registerExtension(bazaarResourceServerExtension)
+
+app.use(paymentMiddleware(
+  {
+    'GET /v1/extract': {
+      accepts: {
+        scheme: 'exact',
+        price: '$0.001',
+        network: NETWORK,
+        payTo: PAYMENT_ADDRESS,
+        maxTimeoutSeconds: 60,
+      },
+      resource: `${PUBLIC_URL}/v1/extract`,
+      description: 'Extract clean, LLM-ready markdown or text from a public HTTP(S) URL',
+      mimeType: 'application/json',
+      serviceName: 'Extract',
+      tags: ['content-extraction', 'markdown', 'ai-agents'],
+      iconUrl: `${PUBLIC_URL}/logo.svg`,
+      extensions: declareDiscoveryExtension({
+        input: {
+          url: 'https://example.com/article',
+          format: 'markdown',
+        },
+        inputSchema: {
+          properties: {
+            url: { type: 'string', format: 'uri', description: 'Fully-qualified public HTTP(S) URL' },
+            format: { type: 'string', enum: ['markdown', 'text'], default: 'markdown' },
+          },
+          required: ['url'],
+          additionalProperties: false,
+        },
+        output: {
+          example: {
+            title: 'Article Title',
+            byline: null,
+            url: 'https://example.com/article',
+            content: '# Markdown...',
+            length: 4821,
+            word_count: 800,
+            extraction_method: 'crawl4ai',
+            lang: 'en',
+          },
+          schema: {
+            properties: {
+              title: { type: ['string', 'null'] },
+              byline: { type: ['string', 'null'] },
+              url: { type: 'string', format: 'uri' },
+              content: { type: ['string', 'null'] },
+              length: { type: 'integer' },
+              word_count: { type: 'integer' },
+              extraction_method: { type: 'string', enum: ['crawl4ai', 'readability'] },
+              lang: { type: 'string' },
+            },
+            required: ['title', 'byline', 'url', 'content', 'length', 'word_count', 'extraction_method', 'lang'],
+            additionalProperties: false,
+          },
+        },
+      }),
+    },
+    'POST /v1/extract/batch': {
+      accepts: {
+        scheme: 'exact',
+        price: '$0.005',
+        network: NETWORK,
+        payTo: PAYMENT_ADDRESS,
+        maxTimeoutSeconds: 60,
+      },
+      resource: `${PUBLIC_URL}/v1/extract/batch`,
+      description: 'Batch extract clean, LLM-ready markdown or text from 1 to 5 public HTTP(S) URLs',
+      mimeType: 'application/json',
+      serviceName: 'Extract',
+      tags: ['content-extraction', 'batch', 'markdown', 'ai-agents'],
+      iconUrl: `${PUBLIC_URL}/logo.svg`,
+      extensions: declareDiscoveryExtension({
+        bodyType: 'json',
+        input: {
+          urls: ['https://example.com/article'],
+          format: 'markdown',
+        },
+        inputSchema: {
+          properties: {
+            urls: {
+              type: 'array',
+              items: { type: 'string', format: 'uri' },
+              minItems: 1,
+              maxItems: 5,
+            },
+            format: { type: 'string', enum: ['markdown', 'text'], default: 'markdown' },
+          },
+          required: ['urls'],
+          additionalProperties: false,
+        },
+        output: {
+          example: {
+            results: [{
+              title: 'Article Title',
+              byline: null,
+              url: 'https://example.com/article',
+              content: '# Markdown...',
+              length: 4821,
+              word_count: 800,
+              extraction_method: 'crawl4ai',
+              lang: 'en',
+            }],
+          },
+        },
+      }),
+    },
+  },
+  resourceServer
 ))
 
 app.use(['/v1/extract', '/v1/extract/batch'], (req, _res, next) => {
@@ -634,7 +716,7 @@ const openApiSpec = {
   openapi: '3.0.3',
   info: {
     title: 'extract.dkta.dev',
-    version: '1.2.4',
+    version: '2.0.0',
     description:
       'Clean content extraction for AI agents. A single request costs **$0.001 USDC** ' +
       'and a batch of up to 5 URLs costs **$0.005 USDC** on Base mainnet via the ' +
@@ -648,8 +730,8 @@ const openApiSpec = {
         summary: 'Extract readable content from a URL',
         description:
           'Fetches the target URL with Crawl4AI first, then falls back to Mozilla Readability, ' +
-          'and returns structured markdown or plain text. Requires an x402 micropayment ' +
-          '($0.001 USDC on Base mainnet) in the `X-PAYMENT` header.',
+          'and returns structured markdown or plain text. Requires an x402 v2 micropayment ' +
+          '($0.001 USDC on Base mainnet) in the `PAYMENT-SIGNATURE` header.',
         operationId: 'extractUrl',
         parameters: [
           {
@@ -683,7 +765,7 @@ const openApiSpec = {
                 description: 'Request lifecycle UUID.',
                 schema: { type: 'string', format: 'uuid' },
               },
-              'X-PAYMENT-RESPONSE': {
+              'PAYMENT-RESPONSE': {
                 description: 'Base64-encoded x402 settlement receipt.',
                 schema: { type: 'string' },
               },
@@ -723,41 +805,16 @@ const openApiSpec = {
           },
           '402': {
             description:
-              'Payment required. The server returns x402-compliant payment details. ' +
-              'Re-submit the request with a valid `X-PAYMENT` header containing the ' +
-              'signed USDC transfer.',
+              'Payment required. Decode the base64 `PAYMENT-REQUIRED` header, sign one ' +
+              'accepted payment option, and retry with the result in `PAYMENT-SIGNATURE`.',
             headers: {
               'X-Request-ID': {
                 description: 'Client-generated UUID. Send the same value on the paid retry to correlate the lifecycle.',
                 schema: { type: 'string', format: 'uuid' },
               },
-            },
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  properties: {
-                    error:   { type: 'string', example: 'Payment required' },
-                    accepts: {
-                      type: 'array',
-                      items: {
-                        type: 'object',
-                        properties: {
-                          scheme:  { type: 'string', example: 'exact' },
-                          network: { type: 'string', example: 'base' },
-                          maxAmountRequired: { type: 'string', example: '1000' },
-                          resource: { type: 'string', example: 'https://extract.dkta.dev/v1/extract' },
-                          description: { type: 'string' },
-                          mimeType: { type: 'string', example: 'application/json' },
-                          payTo: { type: 'string', example: PAYMENT_ADDRESS },
-                          requiredDeadlineSeconds: { type: 'integer', example: 300 },
-                          asset: { type: 'string', example: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
-                          extra: { type: 'object' },
-                        },
-                      },
-                    },
-                  },
-                },
+              'PAYMENT-REQUIRED': {
+                description: 'Base64-encoded x402 v2 payment requirements, including Bazaar discovery metadata.',
+                schema: { type: 'string' },
               },
             },
           },
@@ -821,7 +878,7 @@ const openApiSpec = {
                 description: 'Request lifecycle UUID.',
                 schema: { type: 'string', format: 'uuid' },
               },
-              'X-PAYMENT-RESPONSE': {
+              'PAYMENT-RESPONSE': {
                 description: 'Base64-encoded x402 settlement receipt.',
                 schema: { type: 'string' },
               },
@@ -859,11 +916,14 @@ const openApiSpec = {
           },
           '402': {
             description: 'Payment required ($0.005 USDC on Base mainnet)',
-            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
             headers: {
               'X-Request-ID': {
                 description: 'Client-generated UUID. Send the same value on the paid retry to correlate the lifecycle.',
                 schema: { type: 'string', format: 'uuid' },
+              },
+              'PAYMENT-REQUIRED': {
+                description: 'Base64-encoded x402 v2 payment requirements, including Bazaar discovery metadata.',
+                schema: { type: 'string' },
               },
             },
           },
@@ -898,10 +958,10 @@ const openApiSpec = {
       x402Payment: {
         type: 'apiKey',
         in: 'header',
-        name: 'X-PAYMENT',
+        name: 'PAYMENT-SIGNATURE',
         description:
-          'x402 signed payment header from an x402-compatible wallet client such as `x402-fetch`. ' +
-          `Single requests authorize $0.001 USDC and batches authorize $0.005 USDC on Base mainnet, payable to \`${PAYMENT_ADDRESS}\`.`,
+          'x402 v2 signed payment header from an x402-compatible wallet client such as `@x402/fetch`. ' +
+          `Single requests authorize $0.001 USDC and batches authorize $0.005 USDC on Base mainnet (\`${NETWORK}\`), payable to \`${PAYMENT_ADDRESS}\`.`,
       },
     },
     schemas: {
@@ -1734,11 +1794,17 @@ app.get('/', (_req, res) => {
           <div class="code-body">
 
             <div id="pane-js" class="tab-pane active">
-<pre><span class="t-comment">// walletClient signs Base USDC; x402 pays and retries automatically</span>
-<span class="t-keyword">import</span> { <span class="t-fn">randomUUID</span> } <span class="t-keyword">from</span> <span class="t-string">"node:crypto"</span>;
-<span class="t-keyword">import</span> { <span class="t-fn">wrapFetchWithPayment</span> } <span class="t-keyword">from</span> <span class="t-string">"x402-fetch"</span>;
+<pre><span class="t-comment">// Self-custodied Base wallet; x402 pays and retries automatically</span>
+<span class="t-keyword">import</span> { <span class="t-fn">x402Client</span> } <span class="t-keyword">from</span> <span class="t-string">"@x402/core/client"</span>;
+<span class="t-keyword">import</span> { <span class="t-fn">registerExactEvmScheme</span> } <span class="t-keyword">from</span> <span class="t-string">"@x402/evm/exact/client"</span>;
+<span class="t-keyword">import</span> { <span class="t-fn">wrapFetchWithPayment</span> } <span class="t-keyword">from</span> <span class="t-string">"@x402/fetch"</span>;
+<span class="t-keyword">import</span> { <span class="t-fn">privateKeyToAccount</span> } <span class="t-keyword">from</span> <span class="t-string">"viem/accounts"</span>;
 
-<span class="t-keyword">const</span> <span class="t-var">paidFetch</span> = <span class="t-fn">wrapFetchWithPayment</span>(globalThis.fetch, walletClient);
+<span class="t-keyword">const</span> <span class="t-var">client</span> = <span class="t-keyword">new</span> <span class="t-fn">x402Client</span>();
+<span class="t-fn">registerExactEvmScheme</span>(<span class="t-var">client</span>, {
+  signer: <span class="t-fn">privateKeyToAccount</span>(process.env.EVM_PRIVATE_KEY)
+});
+<span class="t-keyword">const</span> <span class="t-var">paidFetch</span> = <span class="t-fn">wrapFetchWithPayment</span>(globalThis.fetch, <span class="t-var">client</span>);
 <span class="t-keyword">const</span> <span class="t-var">res</span> = <span class="t-keyword">await</span> <span class="t-fn">paidFetch</span>(
   <span class="t-string">"https://extract.dkta.dev/v1/extract?url=https://example.com&amp;format=markdown"</span>,
   { headers: { <span class="t-string">"X-Request-ID"</span>: <span class="t-fn">randomUUID</span>() } }
@@ -1751,25 +1817,31 @@ app.get('/', (_req, res) => {
 <span class="t-fn">curl</span> <span class="t-string">"https://extract.dkta.dev/health"</span>
 <span class="t-fn">curl</span> <span class="t-var">-i</span> <span class="t-string">"https://extract.dkta.dev/v1/extract?url=https://example.com"</span>
 
-<span class="t-comment"># A compatible client generates the signed X-PAYMENT value</span>
+<span class="t-comment"># A compatible x402 v2 client generates the signed payment value</span>
 <span class="t-fn">curl</span> <span class="t-string">"https://extract.dkta.dev/v1/extract?url=https://example.com"</span> \\
   -H <span class="t-string">"X-Request-ID: &lt;same-uuid&gt;"</span> \\
-  -H <span class="t-string">"X-PAYMENT: &lt;signed-payment&gt;"</span></pre>
+  -H <span class="t-string">"PAYMENT-SIGNATURE: &lt;signed-payment&gt;"</span></pre>
             </div>
 
             <div id="pane-python" class="tab-pane">
-<pre><span class="t-keyword">from</span> uuid <span class="t-keyword">import</span> uuid4
-<span class="t-keyword">import</span> requests
+<pre><span class="t-keyword">import</span> os
+<span class="t-keyword">from</span> eth_account <span class="t-keyword">import</span> Account
+<span class="t-keyword">from</span> x402 <span class="t-keyword">import</span> x402ClientSync
+<span class="t-keyword">from</span> x402.http.clients <span class="t-keyword">import</span> x402_requests
+<span class="t-keyword">from</span> x402.mechanisms.evm <span class="t-keyword">import</span> EthAccountSigner
+<span class="t-keyword">from</span> x402.mechanisms.evm.exact.register <span class="t-keyword">import</span> register_exact_evm_client
 
-<span class="t-var">attempt_id</span> = <span class="t-fn">str</span>(<span class="t-fn">uuid4</span>())
-<span class="t-var">res</span> = requests.<span class="t-fn">get</span>(
-    <span class="t-string">"https://extract.dkta.dev/v1/extract"</span>,
-    params={<span class="t-string">"url"</span>: <span class="t-string">"https://example.com"</span>},
-    headers={<span class="t-string">"X-Request-ID"</span>: <span class="t-var">attempt_id</span>},
+<span class="t-var">client</span> = <span class="t-fn">x402ClientSync</span>()
+<span class="t-fn">register_exact_evm_client</span>(
+    <span class="t-var">client</span>,
+    <span class="t-fn">EthAccountSigner</span>(Account.<span class="t-fn">from_key</span>(os.environ[<span class="t-string">"EVM_PRIVATE_KEY"</span>]))
 )
-<span class="t-keyword">assert</span> <span class="t-var">res</span>.status_code == <span class="t-num">402</span>
-<span class="t-fn">print</span>(<span class="t-var">res</span>.json()[<span class="t-string">"accepts"</span>][<span class="t-num">0</span>])
-<span class="t-comment"># Use the official x402[requests] wrapper and an EVM signer to pay.</span></pre>
+<span class="t-keyword">with</span> <span class="t-fn">x402_requests</span>(<span class="t-var">client</span>) <span class="t-keyword">as</span> <span class="t-var">session</span>:
+    <span class="t-var">res</span> = <span class="t-var">session</span>.<span class="t-fn">get</span>(
+        <span class="t-string">"https://extract.dkta.dev/v1/extract"</span>,
+        params={<span class="t-string">"url"</span>: <span class="t-string">"https://example.com"</span>},
+    )
+    <span class="t-fn">print</span>(<span class="t-var">res</span>.<span class="t-fn">json</span>()[<span class="t-string">"content"</span>])</pre>
             </div>
 
           </div>
@@ -1860,7 +1932,7 @@ app.get('/', (_req, res) => {
   <span class="t-var">?url</span>=https://en.wikipedia.org/wiki/Markdown
   <span class="t-var">&amp;format</span>=markdown
 
-<span class="t-comment">X-PAYMENT: &lt;x402-proof&gt;
+<span class="t-comment">PAYMENT-SIGNATURE: &lt;x402-proof&gt;
 Host: extract.dkta.dev</span></pre>
           </div>
         </div>
@@ -2015,22 +2087,20 @@ app.get('/.well-known/ai-plugin.json', (_req, res) => {
 
 // Well-known x402.json for agent framework autodiscovery
 const x402Manifest = {
-  version: '1',
-  x402Version: 1,
+  version: '2',
+  x402Version: 2,
   endpoints: [
     {
       path: '/v1/extract',
       method: 'GET',
-      network: 'base',
-      caip2Network: 'eip155:8453',
+      network: 'eip155:8453',
       asset: 'USDC',
       description: 'Extract clean, LLM-ready markdown from a public URL for $0.001 USDC.',
     },
     {
       path: '/v1/extract/batch',
       method: 'POST',
-      network: 'base',
-      caip2Network: 'eip155:8453',
+      network: 'eip155:8453',
       asset: 'USDC',
       description: 'Batch extract 1 to 5 public URLs for a flat $0.005 USDC.',
     },

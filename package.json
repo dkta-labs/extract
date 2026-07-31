@@ -1,13 +1,19 @@
 {
   "name": "extract",
-  "version": "1.2.4",
+  "version": "2.0.0",
   "description": "Pay-per-use x402 API for extracting clean, LLM-ready markdown from public URLs",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs"
   },
-  "keywords": ["x402", "content-extraction", "markdown", "llm", "web"],
+  "keywords": [
+    "x402",
+    "content-extraction",
+    "markdown",
+    "llm",
+    "web"
+  ],
   "author": "Dkta Labs",
   "license": "ISC",
   "homepage": "https://extract.dkta.dev",
@@ -18,11 +24,16 @@
   "dependencies": {
     "@coinbase/x402": "^2.1.0",
     "@mozilla/readability": "^0.6.0",
+    "@x402/core": "^2.20.0",
+    "@x402/evm": "^2.20.0",
+    "@x402/express": "^2.20.0",
+    "@x402/extensions": "^2.20.0",
     "express": "^5.2.1",
     "jsdom": "^29.1.1",
-    "node-fetch": "^3.3.2",
-    "viem": "^2.48.8",
-    "x402": "^1.2.0",
-    "x402-express": "^1.2.0"
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@x402/fetch": "^2.20.0",
+    "viem": "^2.48.8"
   }
 }
