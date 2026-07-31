@@ -42,12 +42,38 @@ jobs:
         env:
           IMAGE: ghcr.io/dkta-labs/extract:sha-${{ github.sha }}
         run: |
+          node --input-type=module -e '
+            import { createServer } from "node:http";
+            createServer((request, response) => {
+              response.setHeader("Content-Type", "application/json");
+              if (request.url === "/supported") {
+                response.end(JSON.stringify({
+                  kinds: [{ x402Version: 2, scheme: "exact", network: "eip155:8453" }],
+                  extensions: ["bazaar"],
+                  signers: {}
+                }));
+                return;
+              }
+              response.statusCode = 404;
+              response.end(JSON.stringify({ error: "not found" }));
+            }).listen(17402, "0.0.0.0");
+          ' &
+          facilitator_pid=$!
+          cleanup() {
+            docker rm --force extract-oci >/dev/null 2>&1 || true
+            kill "$facilitator_pid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          curl --fail --retry 10 --retry-delay 1 --silent http://127.0.0.1:17402/supported >/dev/null
           docker run --detach --name extract-oci --publish 127.0.0.1:3721:3721 \
-            --env PAYMENT_ADDRESS=0x0000000000000000000000000000000000000001 "$IMAGE"
-          trap 'docker rm --force extract-oci' EXIT
+            --add-host host.docker.internal:host-gateway \
+            --env PAYMENT_ADDRESS=0x0000000000000000000000000000000000000001 \
+            --env FACILITATOR_URL=http://host.docker.internal:17402 "$IMAGE"
           test "$(docker inspect --format '{{.Config.User}}' extract-oci)" = node
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:3721/health; then
+              sleep 1
+              test "$(docker inspect --format '{{.State.Running}}' extract-oci)" = true
               exit 0
             fi
             sleep 1
