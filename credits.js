@@ -394,9 +394,16 @@ export function createCreditService(env = process.env) {
     paymentLinkUrl: env.STRIPE_PAYMENT_LINK_URL,
     webhookSecret: env.STRIPE_WEBHOOK_SECRET,
   }
-  const configured = Object.values(required).filter(Boolean).length
-  if (configured === 0) return null
-  if (configured !== Object.keys(required).length) {
+  const activationConfigured = [
+    required.paymentLinkId,
+    required.paymentLinkUrl,
+    required.webhookSecret,
+  ].filter(Boolean).length
+  if (activationConfigured === 0) return null
+  if (
+    activationConfigured !== 3 ||
+    !required.databasePath
+  ) {
     throw new Error(
       'prepaid credits require CREDIT_DB_PATH, STRIPE_PAYMENT_LINK_ID, ' +
       'STRIPE_PAYMENT_LINK_URL, and STRIPE_WEBHOOK_SECRET'
