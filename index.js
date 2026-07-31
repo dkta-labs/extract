@@ -2394,7 +2394,7 @@ Host: extract.dkta.dev</span></pre>
     <div class="container">
       <p class="section-label">Pricing</p>
       <h2>Simple math.</h2>
-      <p class="section-sub">Pay per request with x402, or buy an optional $10 prepaid API key by card. No account or subscription.</p>
+      <p class="section-sub">${creditService ? 'Pay per request with x402, or buy an optional $10 prepaid API key by card. No account or subscription.' : 'Pay per request with x402. No account, API key, subscription, or minimum spend.'}</p>
       <div class="pricing-card">
         <div class="price-display">
           <span class="price-amount">$0.001</span>
@@ -2408,7 +2408,7 @@ Host: extract.dkta.dev</span></pre>
           <div class="pricing-detail"><span class="check">✓</span> x402 has no minimum spend</div>
           <div class="pricing-detail"><span class="check">✓</span> Input checked before charging</div>
           <div class="pricing-detail"><span class="check">✓</span> Wallet path needs no API key</div>
-          <div class="pricing-detail"><span class="check">✓</span> Optional card-funded API key</div>
+          ${creditService ? '<div class="pricing-detail"><span class="check">✓</span> Optional card-funded API key</div>' : ''}
         </div>
 
         ${creditService ? `
@@ -2424,7 +2424,7 @@ Host: extract.dkta.dev</span></pre>
         <div class="pricing-chain">
           <div class="chain-logo">
             <div class="chain-dot"></div>
-            Paid via x402 on Base or Stripe-hosted prepaid checkout
+            Paid via x402 on Base${creditService ? ' or Stripe-hosted prepaid checkout' : ''}
           </div>
           <span>·</span>
           <a href="https://x402.org" style="color: var(--text-tertiary); transition: color 0.15s;" onmouseover="this.style.color='var(--text-secondary)'" onmouseout="this.style.color='var(--text-tertiary)'">x402.org ↗</a>
