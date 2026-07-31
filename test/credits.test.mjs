@@ -21,57 +21,52 @@ function apiKeyFor(label) {
 }
 
 function paidKey(ledger, suffix = 'abcdefgh') {
-  const order = ledger.createOrder()
   const sessionId = `cs_test_${suffix}`
-  ledger.attachCheckoutSession(order.id, sessionId)
-  ledger.fulfillCheckout({
+  const paymentIntentId = `pi_${suffix}`
+  ledger.fulfillPaymentLinkCheckout({
     eventId: `evt_${suffix}`,
-    orderId: order.id,
     sessionId,
-    paymentIntentId: `pi_${suffix}`,
-    units: order.units,
+    paymentIntentId,
+    units: CREDIT_PACKAGE_UNITS,
   })
   const apiKey = apiKeyFor(suffix)
-  return { ...ledger.claimCheckout(sessionId, apiKey), apiKey, order, sessionId }
+  return {
+    ...ledger.claimCheckout(sessionId, apiKey),
+    apiKey,
+    sessionId,
+    paymentIntentId,
+  }
 }
 
 test('idempotently binds a paid Checkout Session to client-generated key material', () => {
   const ledger = new CreditLedger(':memory:')
   try {
-    const order = ledger.createOrder()
-    ledger.attachCheckoutSession(order.id, 'cs_test_fulfillment')
-
-    const fulfilled = ledger.fulfillCheckout({
+    const fulfillment = {
       eventId: 'evt_fulfillment',
-      orderId: order.id,
       sessionId: 'cs_test_fulfillment',
       paymentIntentId: 'pi_fulfillment',
       units: CREDIT_PACKAGE_UNITS,
-    })
-    assert.deepEqual(fulfilled, {
-      duplicate: false,
-      alreadyFulfilled: false,
-      reversed: false,
-    })
-    assert.deepEqual(ledger.fulfillCheckout({
-      eventId: 'evt_fulfillment',
-      orderId: order.id,
-      sessionId: 'cs_test_fulfillment',
-      paymentIntentId: 'pi_fulfillment',
-      units: CREDIT_PACKAGE_UNITS,
-    }), { duplicate: true })
+    }
+    assert.deepEqual(
+      ledger.fulfillPaymentLinkCheckout(fulfillment),
+      { duplicate: false, alreadyFulfilled: false, reversed: false }
+    )
+    assert.deepEqual(
+      ledger.fulfillPaymentLinkCheckout(fulfillment),
+      { duplicate: true }
+    )
 
     const apiKey = apiKeyFor('fulfillment')
-    const claimed = ledger.claimCheckout('cs_test_fulfillment', apiKey)
+    const claimed = ledger.claimCheckout(fulfillment.sessionId, apiKey)
     assert.equal(claimed.alreadyClaimed, false)
     assert.equal(claimed.balanceUnits, CREDIT_PACKAGE_UNITS)
     assert.equal(ledger.inspectApiKey(apiKey).balanceUnits, CREDIT_PACKAGE_UNITS)
     assert.deepEqual(
-      ledger.claimCheckout('cs_test_fulfillment', apiKey),
-      { pending: false, alreadyClaimed: true, balanceUnits: CREDIT_PACKAGE_UNITS }
+      ledger.claimCheckout(fulfillment.sessionId, apiKey),
+      { alreadyClaimed: true, balanceUnits: CREDIT_PACKAGE_UNITS }
     )
     assert.throws(
-      () => ledger.claimCheckout('cs_test_fulfillment', apiKeyFor('different')),
+      () => ledger.claimCheckout(fulfillment.sessionId, apiKeyFor('different')),
       error => error instanceof CreditError && error.code === 'already_claimed' && error.status === 409
     )
   } finally {
@@ -144,13 +139,12 @@ test('rejects invalid keys, insufficient balances, and mismatched Checkout metad
       error => error instanceof CreditError && error.code === 'invalid_api_key'
     )
 
-    const { apiKey, order, sessionId } = paidKey(ledger, 'boundaries')
+    const { apiKey, sessionId, paymentIntentId } = paidKey(ledger, 'boundaries')
     assert.throws(
-      () => ledger.fulfillCheckout({
+      () => ledger.fulfillPaymentLinkCheckout({
         eventId: 'evt_wrong_amount',
-        orderId: order.id,
         sessionId,
-        paymentIntentId: 'pi_boundaries',
+        paymentIntentId,
         units: CREDIT_PACKAGE_UNITS - 1,
       }),
       error => error instanceof CreditError && error.code === 'checkout_mismatch'
@@ -178,19 +172,12 @@ test('rejects unknown credentials without taking the SQLite write lock', () => {
   const directory = mkdtempSync(path.join(tmpdir(), 'extract-credit-claim-'))
   const databasePath = path.join(directory, 'credits.sqlite')
   const ledger = new CreditLedger(databasePath)
-  const pending = ledger.createOrder()
-  const pendingSessionId = 'cs_test_pendingclaim'
-  ledger.attachCheckoutSession(pending.id, pendingSessionId)
   const blocker = new DatabaseSync(databasePath)
   blocker.exec('BEGIN IMMEDIATE')
   try {
     assert.throws(
       () => ledger.claimCheckout('cs_test_unknownclaim', apiKeyFor('unknown')),
       error => error instanceof CreditError && error.code === 'checkout_not_found'
-    )
-    assert.deepEqual(
-      ledger.claimCheckout(pendingSessionId, apiKeyFor('pending')),
-      { pending: true }
     )
     assert.throws(
       () => ledger.reserve(
