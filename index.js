@@ -340,6 +340,7 @@ app.post(
         duplicate: Boolean(result.duplicate),
         ignored: Boolean(result.ignored),
         topped_up: Boolean(result.toppedUp),
+        review: Boolean(result.review),
       })
       return res.json({ received: true })
     } catch (error) {

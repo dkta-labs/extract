@@ -99,6 +99,23 @@ export class CreditLedger {
         received_at TEXT NOT NULL
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS payment_reviews (
+        payment_intent_id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+        amount_refunded_cents INTEGER NOT NULL CHECK (
+          amount_refunded_cents > 0 AND amount_refunded_cents < amount_cents
+        ),
+        received_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS payment_full_refunds (
+        payment_intent_id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL,
+        received_at TEXT NOT NULL
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS credit_reservations (
         api_key_id TEXT NOT NULL REFERENCES api_keys(id),
         request_id TEXT NOT NULL,
@@ -146,14 +163,63 @@ export class CreditLedger {
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS api_key_suspensions (
-        api_key_id TEXT PRIMARY KEY REFERENCES api_keys(id),
-        credit_order_id TEXT REFERENCES credit_orders(id),
+        api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+        credit_order_id TEXT NOT NULL REFERENCES credit_orders(id),
         reason TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (api_key_id, credit_order_id, reason)
       ) STRICT;
     `)
+    this.migrateApiKeySuspensions()
+    this.migrateFullRefunds()
     this.migrateCreditGrants()
     this.releaseOrphanedReservations()
+  }
+
+  migrateFullRefunds() {
+    return this.database.prepare(`
+      INSERT OR IGNORE INTO payment_full_refunds (
+        payment_intent_id, event_id, received_at
+      )
+      SELECT payment_intent_id, event_id, received_at
+      FROM payment_reversals
+      WHERE reason = 'charge.refunded'
+    `).run().changes
+  }
+
+  migrateApiKeySuspensions() {
+    const primaryKey = this.database.prepare(`
+      PRAGMA table_info(api_key_suspensions)
+    `).all()
+      .filter(column => column.pk > 0)
+      .sort((left, right) => left.pk - right.pk)
+      .map(column => column.name)
+    if (
+      primaryKey.length === 3 &&
+      primaryKey[0] === 'api_key_id' &&
+      primaryKey[1] === 'credit_order_id' &&
+      primaryKey[2] === 'reason'
+    ) return false
+
+    return transaction(this.database, () => {
+      this.database.exec(`
+        CREATE TABLE api_key_suspensions_v2 (
+          api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+          credit_order_id TEXT NOT NULL REFERENCES credit_orders(id),
+          reason TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (api_key_id, credit_order_id, reason)
+        ) STRICT;
+        INSERT INTO api_key_suspensions_v2 (
+          api_key_id, credit_order_id, reason, created_at
+        )
+        SELECT api_key_id, credit_order_id, reason, created_at
+        FROM api_key_suspensions;
+        DROP TABLE api_key_suspensions;
+        ALTER TABLE api_key_suspensions_v2 RENAME TO api_key_suspensions;
+      `)
+      return true
+    })
   }
 
   close() {
@@ -360,6 +426,9 @@ export class CreditLedger {
       const reversal = this.database.prepare(`
         SELECT reason FROM payment_reversals WHERE payment_intent_id = ?
       `).get(paymentIntentId)
+      const review = this.database.prepare(`
+        SELECT reason FROM payment_reviews WHERE payment_intent_id = ?
+      `).get(paymentIntentId)
       const orderId = `ord_${randomUUID()}`
       const orderStatus = reversal ? 'reversed' : topupIntent ? 'claimed' : 'paid'
       this.database.prepare(`
@@ -404,12 +473,16 @@ export class CreditLedger {
           this.database.prepare(`
             UPDATE api_keys SET balance_units = balance_units + ? WHERE id = ?
           `).run(units, topupIntent.api_key_id)
-        } else if (reversal.reason === 'charge.dispute.created') {
+        }
+        const suspensionReason = reversal?.reason === 'charge.dispute.created'
+          ? reversal.reason
+          : review?.reason || null
+        if (suspensionReason) {
           this.database.prepare(`
             INSERT OR IGNORE INTO api_key_suspensions (
               api_key_id, credit_order_id, reason, created_at
             ) VALUES (?, ?, ?, ?)
-          `).run(topupIntent.api_key_id, orderId, reversal.reason, timestamp)
+          `).run(topupIntent.api_key_id, orderId, suspensionReason, timestamp)
         }
         const key = this.database.prepare(`
           SELECT key_prefix, balance_units FROM api_keys WHERE id = ?
@@ -429,6 +502,95 @@ export class CreditLedger {
         alreadyFulfilled: false,
         reversed: Boolean(reversal),
       }
+    })
+  }
+
+  flagPartialRefund({
+    eventId,
+    paymentIntentId,
+    amountCents,
+    amountRefundedCents,
+  }) {
+    return transaction(this.database, () => {
+      const seen = this.database.prepare(`
+        SELECT 1 FROM stripe_events WHERE event_id = ?
+      `).get(eventId)
+      if (seen) return { duplicate: true }
+
+      const timestamp = now()
+      const reason = 'charge.partially_refunded'
+      this.database.prepare(`
+        INSERT INTO stripe_events (event_id, received_at) VALUES (?, ?)
+      `).run(eventId, timestamp)
+      const resolvedPayment = this.database.prepare(`
+        SELECT
+          EXISTS(
+            SELECT 1 FROM payment_full_refunds WHERE payment_intent_id = ?
+          ) AS fully_refunded,
+          EXISTS(
+            SELECT 1 FROM payment_reversals
+            WHERE payment_intent_id = ? AND reason = 'charge.dispute.created'
+          ) AS disputed
+      `).get(paymentIntentId, paymentIntentId)
+      if (resolvedPayment.fully_refunded || resolvedPayment.disputed) {
+        const suspension = this.database.prepare(`
+          SELECT 1
+          FROM credit_orders
+          JOIN api_key_suspensions
+            ON api_key_suspensions.api_key_id = credit_orders.api_key_id
+          WHERE credit_orders.stripe_payment_intent_id = ?
+        `).get(paymentIntentId)
+        return {
+          duplicate: false,
+          queued: false,
+          review: false,
+          resolved: true,
+          suspended: Boolean(suspension),
+        }
+      }
+      this.database.prepare(`
+        INSERT INTO payment_reviews (
+          payment_intent_id, event_id, reason, amount_cents,
+          amount_refunded_cents, received_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(payment_intent_id) DO UPDATE SET
+          event_id = CASE
+            WHEN excluded.amount_refunded_cents >= payment_reviews.amount_refunded_cents
+              THEN excluded.event_id
+            ELSE payment_reviews.event_id
+          END,
+          reason = excluded.reason,
+          amount_cents = excluded.amount_cents,
+          amount_refunded_cents = MAX(
+            payment_reviews.amount_refunded_cents,
+            excluded.amount_refunded_cents
+          ),
+          received_at = CASE
+            WHEN excluded.amount_refunded_cents >= payment_reviews.amount_refunded_cents
+              THEN excluded.received_at
+            ELSE payment_reviews.received_at
+          END
+      `).run(
+        paymentIntentId,
+        eventId,
+        reason,
+        amountCents,
+        amountRefundedCents,
+        timestamp
+      )
+      const order = this.database.prepare(`
+        SELECT id, api_key_id FROM credit_orders
+        WHERE stripe_payment_intent_id = ?
+      `).get(paymentIntentId)
+      if (!order?.api_key_id) {
+        return { duplicate: false, queued: true, review: true, suspended: false }
+      }
+      this.database.prepare(`
+        INSERT OR IGNORE INTO api_key_suspensions (
+          api_key_id, credit_order_id, reason, created_at
+        ) VALUES (?, ?, ?, ?)
+      `).run(order.api_key_id, order.id, reason, timestamp)
+      return { duplicate: false, queued: false, review: true, suspended: true }
     })
   }
 
@@ -457,6 +619,24 @@ export class CreditLedger {
             ELSE payment_reversals.received_at
           END
       `).run(paymentIntentId, eventId, reason, timestamp)
+      if (reason === 'charge.refunded') {
+        this.database.prepare(`
+          INSERT INTO payment_full_refunds (
+            payment_intent_id, event_id, received_at
+          ) VALUES (?, ?, ?)
+          ON CONFLICT(payment_intent_id) DO UPDATE SET
+            event_id = excluded.event_id,
+            received_at = excluded.received_at
+        `).run(paymentIntentId, eventId, timestamp)
+      }
+      if (
+        reason === 'charge.refunded' ||
+        reason === 'charge.dispute.created'
+      ) {
+        this.database.prepare(`
+          DELETE FROM payment_reviews WHERE payment_intent_id = ?
+        `).run(paymentIntentId)
+      }
 
       const order = this.database.prepare(`
         SELECT id, api_key_id, status
@@ -465,6 +645,16 @@ export class CreditLedger {
       `).get(paymentIntentId)
       if (!order) {
         return { duplicate: false, queued: true, suspended: false }
+      }
+      if (
+        (reason === 'charge.refunded' || reason === 'charge.dispute.created') &&
+        order.api_key_id
+      ) {
+        this.database.prepare(`
+          DELETE FROM api_key_suspensions
+          WHERE api_key_id = ? AND credit_order_id = ?
+            AND reason = 'charge.partially_refunded'
+        `).run(order.api_key_id, order.id)
       }
 
       const alreadyReversed = order.status === 'reversed'
@@ -504,15 +694,9 @@ export class CreditLedger {
         (reason === 'charge.dispute.created' || spentUnits > 0)
       ) {
         this.database.prepare(`
-          INSERT INTO api_key_suspensions (
+          INSERT OR IGNORE INTO api_key_suspensions (
             api_key_id, credit_order_id, reason, created_at
           ) VALUES (?, ?, ?, ?)
-          ON CONFLICT(api_key_id) DO UPDATE SET
-            credit_order_id = excluded.credit_order_id,
-            reason = CASE
-              WHEN excluded.reason = 'charge.dispute.created' THEN excluded.reason
-              ELSE api_key_suspensions.reason
-            END
         `).run(order.api_key_id, order.id, reason, timestamp)
       }
       const suspension = order.api_key_id
@@ -619,6 +803,16 @@ export class CreditLedger {
         timestamp,
         timestamp
       )
+      const review = this.database.prepare(`
+        SELECT reason FROM payment_reviews WHERE payment_intent_id = ?
+      `).get(order.stripe_payment_intent_id)
+      if (review) {
+        this.database.prepare(`
+          INSERT OR IGNORE INTO api_key_suspensions (
+            api_key_id, credit_order_id, reason, created_at
+          ) VALUES (?, ?, ?, ?)
+        `).run(apiKeyId, order.id, review.reason, timestamp)
+      }
 
       return {
         alreadyClaimed: false,
@@ -883,6 +1077,29 @@ export function createCreditService(env = process.env) {
             'payment reversal is missing its PaymentIntent',
             400
           )
+        }
+        if (event.type === 'charge.refunded') {
+          if (
+            !Number.isInteger(charge.amount) ||
+            !Number.isInteger(charge.amount_refunded) ||
+            charge.amount !== CREDIT_PACKAGE_CENTS ||
+            charge.amount_refunded <= 0 ||
+            charge.amount_refunded > charge.amount
+          ) {
+            throw new CreditError(
+              'reversal_metadata_invalid',
+              'refund amounts do not match the $10 USD Extract credit payment',
+              400
+            )
+          }
+          if (charge.amount_refunded < charge.amount) {
+            return ledger.flagPartialRefund({
+              eventId: event.id,
+              paymentIntentId,
+              amountCents: charge.amount,
+              amountRefundedCents: charge.amount_refunded,
+            })
+          }
         }
         return ledger.reversePayment({
           eventId: event.id,

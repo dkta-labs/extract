@@ -8,6 +8,7 @@ import { Worker } from 'node:worker_threads'
 import Stripe from 'stripe'
 import {
   BATCH_EXTRACTION_UNITS,
+  CREDIT_PACKAGE_CENTS,
   CREDIT_PACKAGE_UNITS,
   CreditError,
   CreditLedger,
@@ -278,22 +279,54 @@ test('migrates active and legacy-refunded keys into scoped grants', () => {
     const legacyDatabase = new DatabaseSync(databasePath)
     legacyDatabase.exec(`
       PRAGMA foreign_keys = OFF;
+      INSERT INTO payment_reversals (
+        payment_intent_id, event_id, reason, received_at
+      ) VALUES (
+        'pi_legacyrefund',
+        'evt_legacy_full_refund',
+        'charge.refunded',
+        '2026-07-29T00:00:00.000Z'
+      );
+      DROP TABLE payment_full_refunds;
       DROP TABLE reservation_grants;
       DROP TABLE topup_fulfillments;
       DROP TABLE topup_intents;
       DROP TABLE api_key_suspensions;
+      CREATE TABLE api_key_suspensions (
+        api_key_id TEXT PRIMARY KEY REFERENCES api_keys(id),
+        credit_order_id TEXT REFERENCES credit_orders(id),
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
       DROP TABLE credit_grants;
     `)
     legacyDatabase.close()
 
     ledger = new CreditLedger(databasePath)
+    assert.deepEqual(
+      ledger.database.prepare('PRAGMA table_info(api_key_suspensions)').all()
+        .filter(column => column.pk > 0)
+        .sort((left, right) => left.pk - right.pk)
+        .map(column => column.name),
+      ['api_key_id', 'credit_order_id', 'reason']
+    )
+    assert.equal(
+      ledger.database.prepare(`
+        SELECT COUNT(*) AS count FROM payment_full_refunds
+        WHERE payment_intent_id = 'pi_legacyrefund'
+      `).get().count,
+      1
+    )
     assert.equal(
       ledger.inspectApiKey(paid.apiKey).balanceUnits,
       CREDIT_PACKAGE_UNITS - SINGLE_EXTRACTION_UNITS
     )
     const grant = ledger.database.prepare(`
-      SELECT units, remaining_units, status FROM credit_grants
-    `).get()
+      SELECT credit_grants.units, credit_grants.remaining_units, credit_grants.status
+      FROM credit_grants
+      JOIN credit_orders ON credit_orders.id = credit_grants.credit_order_id
+      WHERE credit_orders.stripe_payment_intent_id = ?
+    `).get(paid.paymentIntentId)
     assert.deepEqual({ ...grant }, {
       units: CREDIT_PACKAGE_UNITS,
       remaining_units: CREDIT_PACKAGE_UNITS - SINGLE_EXTRACTION_UNITS,
@@ -604,6 +637,377 @@ test('verifies Stripe signatures and exact paid amount before fulfillment', () =
     )
   } finally {
     service.close()
+  }
+})
+
+test('routes partial refunds to review and resolves cumulative full refunds', () => {
+  const webhookSecret = 'whsec_partial_refund'
+  const service = createCreditService({
+    CREDIT_DB_PATH: ':memory:',
+    STRIPE_PAYMENT_LINK_ID: 'plink_partial_refund',
+    STRIPE_PAYMENT_LINK_URL: 'https://buy.stripe.com/test_partial_refund',
+    STRIPE_WEBHOOK_SECRET: webhookSecret,
+  })
+  const deliver = event => {
+    const payload = JSON.stringify(event)
+    const signature = Stripe.webhooks.generateTestHeaderString({
+      payload,
+      secret: webhookSecret,
+    })
+    return service.handleWebhook(Buffer.from(payload), signature)
+  }
+  const refundEvent = (id, paymentIntentId, amountRefunded) => ({
+    id,
+    object: 'event',
+    type: 'charge.refunded',
+    data: {
+      object: {
+        id: `ch_${id}`,
+        object: 'charge',
+        payment_intent: paymentIntentId,
+        amount: CREDIT_PACKAGE_CENTS,
+        amount_refunded: amountRefunded,
+        refunded: amountRefunded === CREDIT_PACKAGE_CENTS,
+      },
+    },
+  })
+  try {
+    const paid = paidKey(service.ledger, 'partialwebhook')
+    assert.deepEqual(
+      deliver(refundEvent('evt_partial_refund', paid.paymentIntentId, 100)),
+      { duplicate: false, queued: false, review: true, suspended: true }
+    )
+    const grantBeforeFullRefund = service.ledger.database.prepare(`
+      SELECT status, remaining_units FROM credit_grants
+      WHERE credit_order_id = (
+        SELECT id FROM credit_orders WHERE stripe_payment_intent_id = ?
+      )
+    `).get(paid.paymentIntentId)
+    assert.deepEqual(
+      { ...grantBeforeFullRefund },
+      { status: 'active', remaining_units: CREDIT_PACKAGE_UNITS }
+    )
+    assert.throws(
+      () => service.ledger.inspectApiKey(paid.apiKey),
+      error => error instanceof CreditError && error.code === 'api_key_suspended'
+    )
+
+    assert.deepEqual(
+      deliver(refundEvent(
+        'evt_full_refund_after_partial',
+        paid.paymentIntentId,
+        CREDIT_PACKAGE_CENTS
+      )),
+      { duplicate: false, queued: false, suspended: false, alreadyReversed: false }
+    )
+    assert.equal(service.ledger.inspectApiKey(paid.apiKey).balanceUnits, 0)
+    assert.equal(
+      service.ledger.database.prepare('SELECT COUNT(*) AS count FROM payment_reviews').get().count,
+      0
+    )
+    assert.equal(
+      service.ledger.database.prepare('SELECT COUNT(*) AS count FROM api_key_suspensions').get().count,
+      0
+    )
+
+    const pendingPaymentIntent = 'pi_partial_before_completion'
+    assert.deepEqual(
+      deliver(refundEvent('evt_partial_before_completion', pendingPaymentIntent, 100)),
+      { duplicate: false, queued: true, review: true, suspended: false }
+    )
+    assert.deepEqual(
+      deliver(refundEvent(
+        'evt_full_before_completion',
+        pendingPaymentIntent,
+        CREDIT_PACKAGE_CENTS
+      )),
+      { duplicate: false, queued: true, suspended: false }
+    )
+    assert.deepEqual(
+      deliver({
+        id: 'evt_completion_after_full_refund',
+        object: 'event',
+        type: 'checkout.session.completed',
+        data: {
+          object: {
+            id: 'cs_test_completion_after_full_refund',
+            object: 'checkout.session',
+            payment_status: 'paid',
+            currency: 'usd',
+            amount_total: CREDIT_PACKAGE_CENTS,
+            payment_intent: pendingPaymentIntent,
+            payment_link: 'plink_partial_refund',
+          },
+        },
+      }),
+      { duplicate: false, alreadyFulfilled: false, reversed: true }
+    )
+    assert.throws(
+      () => service.ledger.claimCheckout(
+        'cs_test_completion_after_full_refund',
+        apiKeyFor('completionafterrefund')
+      ),
+      error => error instanceof CreditError && error.code === 'checkout_not_found'
+    )
+    assert.equal(
+      service.ledger.database.prepare('SELECT COUNT(*) AS count FROM payment_reviews').get().count,
+      0
+    )
+  } finally {
+    service.close()
+  }
+})
+
+
+test('keeps a key suspended while another order remains partially refunded', () => {
+  const ledger = new CreditLedger(':memory:')
+  try {
+    const first = paidKey(ledger, 'twopartials')
+    const topup = ledger.createTopUpIntent(first.apiKey)
+    ledger.fulfillPaymentLinkCheckout({
+      eventId: 'evt_second_partial_order',
+      sessionId: 'cs_test_second_partial_order',
+      paymentIntentId: 'pi_second_partial_order',
+      units: CREDIT_PACKAGE_UNITS,
+      clientReferenceId: topup.intentId,
+    })
+    const firstOrder = ledger.database.prepare(`
+      SELECT id FROM credit_orders WHERE stripe_payment_intent_id = ?
+    `).get(first.paymentIntentId)
+    const secondOrder = ledger.database.prepare(`
+      SELECT id FROM credit_orders WHERE stripe_payment_intent_id = ?
+    `).get('pi_second_partial_order')
+    ledger.flagPartialRefund({
+      eventId: 'evt_first_partial',
+      paymentIntentId: first.paymentIntentId,
+      amountCents: CREDIT_PACKAGE_CENTS,
+      amountRefundedCents: 100,
+    })
+    ledger.flagPartialRefund({
+      eventId: 'evt_second_partial',
+      paymentIntentId: 'pi_second_partial_order',
+      amountCents: CREDIT_PACKAGE_CENTS,
+      amountRefundedCents: 200,
+    })
+    ledger.flagPartialRefund({
+      eventId: 'evt_second_partial_stale',
+      paymentIntentId: 'pi_second_partial_order',
+      amountCents: CREDIT_PACKAGE_CENTS,
+      amountRefundedCents: 100,
+    })
+    assert.deepEqual(
+      {
+        ...ledger.database.prepare(`
+          SELECT event_id, amount_refunded_cents FROM payment_reviews
+          WHERE payment_intent_id = 'pi_second_partial_order'
+        `).get(),
+      },
+      {
+        event_id: 'evt_second_partial',
+        amount_refunded_cents: 200,
+      }
+    )
+    assert.equal(
+      ledger.database.prepare(`
+        SELECT COUNT(*) AS count FROM api_key_suspensions
+      `).get().count,
+      2
+    )
+
+    assert.deepEqual(
+      ledger.reversePayment({
+        eventId: 'evt_first_full_refund',
+        paymentIntentId: first.paymentIntentId,
+        reason: 'charge.refunded',
+      }),
+      { duplicate: false, queued: false, suspended: true, alreadyReversed: false }
+    )
+    assert.deepEqual(
+      ledger.database.prepare(`
+        SELECT credit_order_id, reason FROM api_key_suspensions
+      `).all().map(row => ({ ...row })),
+      [{
+        credit_order_id: secondOrder.id,
+        reason: 'charge.partially_refunded',
+      }]
+    )
+    assert.deepEqual(
+      ledger.database.prepare(`
+        SELECT payment_intent_id FROM payment_reviews
+      `).all().map(row => row.payment_intent_id),
+      ['pi_second_partial_order']
+    )
+    assert.throws(
+      () => ledger.inspectApiKey(first.apiKey),
+      error => error instanceof CreditError && error.code === 'api_key_suspended'
+    )
+    assert.equal(
+      ledger.database.prepare(`
+        SELECT status FROM credit_grants WHERE credit_order_id = ?
+      `).get(firstOrder.id).status,
+      'reversed'
+    )
+  } finally {
+    ledger.close()
+  }
+})
+
+test('preserves an unrelated suspension through partial and full refund events', () => {
+  const ledger = new CreditLedger(':memory:')
+  try {
+    const paid = paidKey(ledger, 'unrelatedsuspension')
+    const topup = ledger.createTopUpIntent(paid.apiKey)
+    ledger.fulfillPaymentLinkCheckout({
+      eventId: 'evt_unrelated_topup',
+      sessionId: 'cs_test_unrelated_topup',
+      paymentIntentId: 'pi_unrelated_topup',
+      units: CREDIT_PACKAGE_UNITS,
+      clientReferenceId: topup.intentId,
+    })
+    const originalOrder = ledger.database.prepare(`
+      SELECT id, api_key_id FROM credit_orders WHERE stripe_payment_intent_id = ?
+    `).get(paid.paymentIntentId)
+    const topupOrder = ledger.database.prepare(`
+      SELECT id FROM credit_orders WHERE stripe_payment_intent_id = ?
+    `).get('pi_unrelated_topup')
+    ledger.reversePayment({
+      eventId: 'evt_unrelated_dispute',
+      paymentIntentId: paid.paymentIntentId,
+      reason: 'charge.dispute.created',
+    })
+    assert.deepEqual(
+      ledger.flagPartialRefund({
+        eventId: 'evt_unrelated_partial_refund',
+        paymentIntentId: 'pi_unrelated_topup',
+        amountCents: CREDIT_PACKAGE_CENTS,
+        amountRefundedCents: 100,
+      }),
+      { duplicate: false, queued: false, review: true, suspended: true }
+    )
+    assert.deepEqual(
+      ledger.database.prepare(`
+        SELECT credit_order_id, reason FROM api_key_suspensions
+        WHERE api_key_id = ?
+        ORDER BY reason
+      `).all(originalOrder.api_key_id).map(row => ({ ...row })),
+      [
+        {
+          credit_order_id: originalOrder.id,
+          reason: 'charge.dispute.created',
+        },
+        {
+          credit_order_id: topupOrder.id,
+          reason: 'charge.partially_refunded',
+        },
+      ]
+    )
+    assert.deepEqual(
+      ledger.reversePayment({
+        eventId: 'evt_unrelated_full_refund',
+        paymentIntentId: 'pi_unrelated_topup',
+        reason: 'charge.refunded',
+      }),
+      { duplicate: false, queued: false, suspended: true, alreadyReversed: false }
+    )
+    assert.deepEqual(
+      {
+        ...ledger.database.prepare(`
+          SELECT credit_order_id, reason FROM api_key_suspensions
+          WHERE api_key_id = ?
+        `).get(originalOrder.api_key_id),
+      },
+      {
+        credit_order_id: originalOrder.id,
+        reason: 'charge.dispute.created',
+      }
+    )
+    assert.equal(
+      ledger.database.prepare(`
+        SELECT status FROM credit_grants WHERE credit_order_id = ?
+      `).get(topupOrder.id).status,
+      'reversed'
+    )
+  } finally {
+    ledger.close()
+  }
+})
+
+test('resolves a partial-refund review into a stronger dispute suspension', () => {
+  const ledger = new CreditLedger(':memory:')
+  try {
+    const paid = paidKey(ledger, 'partialdispute')
+    ledger.flagPartialRefund({
+      eventId: 'evt_partial_before_dispute',
+      paymentIntentId: paid.paymentIntentId,
+      amountCents: CREDIT_PACKAGE_CENTS,
+      amountRefundedCents: 100,
+    })
+    assert.deepEqual(
+      ledger.reversePayment({
+        eventId: 'evt_dispute_after_partial',
+        paymentIntentId: paid.paymentIntentId,
+        reason: 'charge.dispute.created',
+      }),
+      { duplicate: false, queued: false, suspended: true, alreadyReversed: false }
+    )
+    assert.equal(
+      ledger.database.prepare('SELECT COUNT(*) AS count FROM payment_reviews').get().count,
+      0
+    )
+    assert.equal(
+      ledger.database.prepare(`
+        SELECT reason FROM api_key_suspensions
+      `).get().reason,
+      'charge.dispute.created'
+    )
+    assert.deepEqual(
+      ledger.flagPartialRefund({
+        eventId: 'evt_stale_partial_after_dispute',
+        paymentIntentId: paid.paymentIntentId,
+        amountCents: CREDIT_PACKAGE_CENTS,
+        amountRefundedCents: 400,
+      }),
+      {
+        duplicate: false,
+        queued: false,
+        review: false,
+        resolved: true,
+        suspended: true,
+      }
+    )
+    assert.equal(
+      ledger.database.prepare('SELECT COUNT(*) AS count FROM payment_reviews').get().count,
+      0
+    )
+    assert.deepEqual(
+      ledger.reversePayment({
+        eventId: 'evt_full_refund_after_dispute',
+        paymentIntentId: paid.paymentIntentId,
+        reason: 'charge.refunded',
+      }),
+      { duplicate: false, queued: false, suspended: true, alreadyReversed: true }
+    )
+    assert.deepEqual(
+      ledger.flagPartialRefund({
+        eventId: 'evt_stale_partial_after_full_refund',
+        paymentIntentId: paid.paymentIntentId,
+        amountCents: CREDIT_PACKAGE_CENTS,
+        amountRefundedCents: 500,
+      }),
+      {
+        duplicate: false,
+        queued: false,
+        review: false,
+        resolved: true,
+        suspended: true,
+      }
+    )
+    assert.equal(
+      ledger.database.prepare('SELECT COUNT(*) AS count FROM payment_reviews').get().count,
+      0
+    )
+  } finally {
+    ledger.close()
   }
 })
 

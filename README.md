@@ -104,7 +104,7 @@ open "$TOPUP_URL" # use xdg-open on Linux
 
 After payment, Stripe redirects to the success page, which confirms that the existing key was credited. The credential does not change. Call `GET /v1/credits/balance` with the same bearer key to verify the new balance.
 
-Keep API keys out of URLs, logs, source control, and client-side applications. Failed single extractions release their reservation and cost no credits. A batch consumes 5,000 units on its HTTP 200 response, including when individual items contain inline errors. Refunding a completely unspent package removes only that package's units. A refund after any of its units were spent, or a dispute, suspends the key for payment review without deleting unrelated grants.
+Keep API keys out of URLs, logs, source control, and client-side applications. Failed single extractions release their reservation and cost no credits. A batch consumes 5,000 units on its HTTP 200 response, including when individual items contain inline errors. A full refund of a completely unspent package removes only that package's units. A refund after any of its units were spent, or a dispute, suspends the key for payment review without deleting unrelated grants. Partial refunds suspend the key for review without automatically reversing the full grant; a later cumulative full-refund event resolves that partial review before applying the full-refund policy.
 
 ## API
 
