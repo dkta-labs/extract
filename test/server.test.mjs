@@ -8,6 +8,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
 import { JSDOM } from 'jsdom'
+import Stripe from 'stripe'
 import { paymentMiddleware, x402ResourceServer } from '@x402/express'
 import { HTTPFacilitatorClient } from '@x402/core/server'
 import { registerExactEvmScheme } from '@x402/evm/exact/server'
@@ -18,6 +19,9 @@ const PAYER_ADDRESS = '0x1111111111111111111111111111111111111111'
 const SETTLEMENT_TRANSACTION = `0x${'2'.repeat(64)}`
 const NETWORK = 'eip155:8453'
 const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+const STRIPE_PAYMENT_LINK_ID = 'plink_extract_test'
+const STRIPE_PAYMENT_LINK_URL = 'https://buy.stripe.com/test_extract_credits'
+const STRIPE_WEBHOOK_SECRET = 'whsec_extract_test'
 
 let analyticsServer
 let analyticsUrl
@@ -191,6 +195,10 @@ before(async () => {
       FACILITATOR_URL: facilitatorUrl,
       CRAWL4AI_URL: crawlerUrl,
       TEST_PUBLIC_TARGET_PORT: String(targetPort),
+      CREDIT_DB_PATH: path.join(workDir, 'credits.sqlite'),
+      STRIPE_PAYMENT_LINK_ID,
+      STRIPE_PAYMENT_LINK_URL,
+      STRIPE_WEBHOOK_SECRET,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -244,7 +252,7 @@ test('serves healthy discovery and truthful public contracts', async () => {
   assert.match(javascriptExample, /globalThis\.crypto\.randomUUID\(\)/)
 
   const spec = await (await fetch(`${baseUrl}/openapi.json`)).json()
-  assert.equal(spec.info.version, '2.0.0')
+  assert.equal(spec.info.version, '2.1.0')
   assert.equal(spec.components.securitySchemes.x402Payment.description.includes(PAYMENT_ADDRESS), true)
   assert.equal(JSON.stringify(spec).includes('X-RateLimit-Limit'), false)
   assert.equal(spec.paths['/v1/extract'].get.parameters.at(-1).schema.format, 'uuid')
@@ -257,6 +265,170 @@ test('serves healthy discovery and truthful public contracts', async () => {
     spec.paths['/v1/extract'].get.responses['200'].content['application/json'].schema.required,
     ['title', 'byline', 'url', 'content', 'length', 'word_count', 'extraction_method', 'lang']
   )
+})
+
+test('handles redirect-before-webhook and spends prepaid credits with an API key', async () => {
+  const checkout = await fetch(`${baseUrl}/v1/credits/checkout`)
+  assert.equal(checkout.status, 200)
+  assert.match(checkout.headers.get('cache-control'), /max-age=300/)
+  assert.deepEqual(await checkout.json(), {
+    checkout_url: STRIPE_PAYMENT_LINK_URL,
+    credit_units: 10_000_000,
+    single_extractions: 10_000,
+    price_usd: 10,
+  })
+
+  const successPage = await fetch(`${baseUrl}/credits/success`)
+  const successHtml = await successPage.text()
+  assert.equal(successPage.status, 200)
+  assert.equal(successPage.headers.get('referrer-policy'), 'no-referrer')
+  assert.match(successPage.headers.get('cache-control'), /no-store/)
+  assert.doesNotMatch(successHtml, /analytics\.dkta|fonts\.googleapis|session_id\s*=/)
+  assert.match(successHtml, /body\.code === 'checkout_not_found'/)
+
+  const browserClaims = []
+  const copiedKeys = []
+  const successDom = new JSDOM(successHtml, {
+    url: `${baseUrl}/credits/success?session_id=cs_test_browsercontract`,
+    runScripts: 'dangerously',
+    beforeParse(window) {
+      window.fetch = async (_url, options) => {
+        const body = JSON.parse(options.body)
+        browserClaims.push(body)
+        return {
+          status: 200,
+          ok: true,
+          json: async () => ({
+            api_key: body.api_key,
+            balance_units: 10_000_000,
+            single_extractions_remaining: 10_000,
+          }),
+        }
+      }
+      Object.defineProperty(window.navigator, 'clipboard', {
+        value: { writeText: async value => copiedKeys.push(value) },
+      })
+    },
+  })
+  try {
+    for (let attempt = 0; attempt < 50 && browserClaims.length < 1; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    const browserCandidate = browserClaims[0]?.api_key
+    assert.match(browserCandidate, /^ext_live_[A-Za-z0-9_-]{43}$/)
+    assert.equal(
+      successDom.window.sessionStorage.getItem('extract:claim:cs_test_browsercontract'),
+      browserCandidate
+    )
+    assert.equal(successDom.window.location.search, '?session_id=cs_test_browsercontract')
+
+    await successDom.window.claim()
+    assert.equal(browserClaims[1].api_key, browserCandidate)
+    successDom.window.document.getElementById('copy').click()
+    for (
+      let attempt = 0;
+      attempt < 50 && successDom.window.document.getElementById('copy').textContent !== 'Copied';
+      attempt += 1
+    ) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    assert.deepEqual(copiedKeys, [browserCandidate])
+    assert.equal(successDom.window.location.pathname, '/credits/success')
+    assert.equal(successDom.window.location.search, '')
+    assert.equal(
+      successDom.window.sessionStorage.getItem('extract:claim:cs_test_browsercontract'),
+      null
+    )
+  } finally {
+    successDom.window.close()
+  }
+
+  const sessionId = 'cs_test_redirectbeforewebhook'
+  const candidateApiKey = `ext_live_${'R'.repeat(43)}`
+  const pending = await fetch(`${baseUrl}/v1/credits/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, api_key: candidateApiKey }),
+  })
+  assert.equal(pending.status, 404)
+  assert.equal((await pending.json()).code, 'checkout_not_found')
+
+  const payload = JSON.stringify({
+    id: 'evt_redirectbeforewebhook',
+    object: 'event',
+    type: 'checkout.session.completed',
+    data: {
+      object: {
+        id: sessionId,
+        object: 'checkout.session',
+        payment_status: 'paid',
+        currency: 'usd',
+        amount_total: 1000,
+        payment_intent: 'pi_redirectbeforewebhook',
+        payment_link: STRIPE_PAYMENT_LINK_ID,
+      },
+    },
+  })
+  const stripe = new Stripe('sk_test_unused')
+  const signature = stripe.webhooks.generateTestHeaderString({
+    payload,
+    secret: STRIPE_WEBHOOK_SECRET,
+  })
+  const webhook = await fetch(`${baseUrl}/v1/credits/stripe-webhook`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Stripe-Signature': signature,
+    },
+    body: payload,
+  })
+  assert.equal(webhook.status, 200)
+  assert.deepEqual(await webhook.json(), { received: true })
+
+  const claimed = await fetch(`${baseUrl}/v1/credits/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, api_key: candidateApiKey }),
+  })
+  assert.equal(claimed.status, 200)
+  const claim = await claimed.json()
+  assert.equal(claim.api_key, candidateApiKey)
+  assert.equal(claim.single_extractions_remaining, 10_000)
+
+  const retriedClaim = await fetch(`${baseUrl}/v1/credits/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, api_key: candidateApiKey }),
+  })
+  assert.equal(retriedClaim.status, 200)
+  assert.equal((await retriedClaim.json()).api_key, candidateApiKey)
+
+  const changedClaim = await fetch(`${baseUrl}/v1/credits/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, api_key: `ext_live_${'S'.repeat(43)}` }),
+  })
+  assert.equal(changedClaim.status, 409)
+
+  const requestId = 'de6c78ab-a613-4b26-91d7-a88403cdfad4'
+  const target = 'https://1.1.1.1'
+  const extracted = await fetch(
+    `${baseUrl}/v1/extract?url=${encodeURIComponent(target)}&format=text`,
+    {
+      headers: {
+        Authorization: `Bearer ${claim.api_key}`,
+        'X-Request-ID': requestId,
+      },
+    }
+  )
+  assert.equal(extracted.status, 200, await extracted.text())
+  assert.equal(extracted.headers.get('payment-response'), null)
+
+  const balance = await fetch(`${baseUrl}/v1/credits/balance`, {
+    headers: { Authorization: `Bearer ${claim.api_key}` },
+  })
+  assert.equal(balance.status, 200)
+  assert.equal((await balance.json()).single_extractions_remaining, 9_999)
 })
 
 test('rejects invalid and non-public targets before payment', async t => {
@@ -435,17 +607,19 @@ test('records a normalized single hostname without URL secrets', async () => {
 
   const analytics = (await waitForEvent('extract-request', requestId)).body.payload.data
   assert.deepEqual(Object.keys(analytics).sort(), [
-    'duration_ms', 'format', 'length', 'request_id', 'status', 'target_hostname',
+    'duration_ms', 'format', 'length', 'payment_method', 'request_id', 'status', 'target_hostname',
   ])
   assert.equal(analytics.target_hostname, 'example.com')
   assert.equal(analytics.request_id, requestId)
+  assert.equal(analytics.payment_method, 'x402')
 
   const entries = (await readFile(path.join(workDir, 'requests.jsonl'), 'utf8'))
     .trim().split('\n').map(line => JSON.parse(line))
   const logged = entries.find(entry => entry.event === 'success' && entry.request_id === requestId)
   assert.ok(logged)
   assert.deepEqual(Object.keys(logged).sort(), [
-    'duration_ms', 'endpoint', 'event', 'format', 'length', 'request_id', 'target_hostname', 'ts',
+    'duration_ms', 'endpoint', 'event', 'format', 'length', 'payment_method', 'request_id',
+    'status', 'target_hostname', 'ts',
   ])
   assert.equal(logged.target_hostname, 'example.com')
 
@@ -473,13 +647,14 @@ test('records a paid single failure hostname without URL secrets', async () => {
 
   const analytics = (await waitForEvent('extract-request', requestId)).body.payload.data
   assert.deepEqual(Object.keys(analytics).sort(), [
-    'duration_ms', 'format', 'reason', 'request_id', 'status', 'target_hostname',
+    'duration_ms', 'format', 'payment_method', 'reason', 'request_id', 'status', 'target_hostname',
   ])
   assert.equal(analytics.target_hostname, 'example.com')
   assert.equal(analytics.request_id, requestId)
   assert.equal(analytics.status, 500)
   assert.equal(analytics.reason, 'internal_error')
   assert.equal(analytics.format, 'text')
+  assert.equal(analytics.payment_method, 'x402')
   assert.equal(typeof analytics.duration_ms, 'number')
 
   const entries = (await readFile(path.join(workDir, 'requests.jsonl'), 'utf8'))
@@ -487,8 +662,8 @@ test('records a paid single failure hostname without URL secrets', async () => {
   const logged = entries.find(entry => entry.event === 'failure' && entry.request_id === requestId)
   assert.ok(logged)
   assert.deepEqual(Object.keys(logged).sort(), [
-    'duration_ms', 'endpoint', 'event', 'format', 'reason', 'request_id', 'status',
-    'target_hostname', 'ts',
+    'duration_ms', 'endpoint', 'event', 'format', 'payment_method', 'reason', 'request_id',
+    'status', 'target_hostname', 'ts',
   ])
   assert.equal(logged.target_hostname, analytics.target_hostname)
   assert.equal(logged.endpoint, '/v1/extract')
@@ -538,7 +713,7 @@ test('records bounded batch hostnames aligned with outcomes without URL secrets'
 
   const analytics = (await waitForEvent('extract-batch', requestId)).body.payload.data
   assert.deepEqual(Object.keys(analytics).sort(), [
-    'count', 'duration_ms', 'failure_count', 'format', 'request_id', 'status',
+    'count', 'duration_ms', 'failure_count', 'format', 'payment_method', 'request_id', 'status',
     'target_hostname_1', 'target_hostname_2', 'target_outcome_1', 'target_outcome_2',
   ])
   assert.deepEqual(
@@ -546,6 +721,7 @@ test('records bounded batch hostnames aligned with outcomes without URL secrets'
     ['example.com', 'success', 'example.org', 'success']
   )
   assert.equal(Object.values(analytics).every(value => ['number', 'string'].includes(typeof value)), true)
+  assert.equal(analytics.payment_method, 'x402')
 
   const settlement = (await waitForEvent('payment-settled', requestId)).body.payload.data
   assert.equal(settlement.endpoint, '/v1/extract/batch')
@@ -554,8 +730,9 @@ test('records bounded batch hostnames aligned with outcomes without URL secrets'
   const logged = entries.find(entry => entry.event === 'success' && entry.request_id === requestId)
   assert.ok(logged)
   assert.deepEqual(Object.keys(logged).sort(), [
-    'count', 'duration_ms', 'endpoint', 'event', 'failure_count', 'format', 'request_id',
-    'target_hostname_1', 'target_hostname_2', 'target_outcome_1', 'target_outcome_2', 'ts',
+    'count', 'duration_ms', 'endpoint', 'event', 'failure_count', 'format', 'payment_method',
+    'request_id', 'status', 'target_hostname_1', 'target_hostname_2', 'target_outcome_1',
+    'target_outcome_2', 'ts',
   ])
   assert.deepEqual(
     [logged.target_hostname_1, logged.target_outcome_1, logged.target_hostname_2, logged.target_outcome_2],

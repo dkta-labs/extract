@@ -18,6 +18,12 @@ import { Agent as HttpAgent } from 'node:http'
 import { Agent as HttpsAgent } from 'node:https'
 import { BlockList, isIP } from 'node:net'
 import { startRequestLogMaintenance } from './request-log.js'
+import {
+  BATCH_EXTRACTION_UNITS,
+  CreditError,
+  SINGLE_EXTRACTION_UNITS,
+  createCreditService,
+} from './credits.js'
 
 const LOG_PATH = process.env.LOG_PATH || '/srv/dkta/extract/logs/requests.jsonl'
 
@@ -71,6 +77,7 @@ const PORT = process.env.PORT || 3721
 const PAYMENT_ADDRESS = process.env.PAYMENT_ADDRESS
 const NETWORK = process.env.NETWORK || 'eip155:8453'
 const PUBLIC_URL = process.env.PUBLIC_URL || 'https://extract.dkta.dev'
+const creditService = createCreditService(process.env, PUBLIC_URL)
 
 if (!PAYMENT_ADDRESS || !/^0x[0-9a-fA-F]{40}$/.test(PAYMENT_ADDRESS)) {
   throw new Error('PAYMENT_ADDRESS must be set to a valid EVM address')
@@ -196,6 +203,7 @@ function recordSingleFailure(req, format, ts, start, status, reason) {
   const endpoint = '/v1/extract'
   const event = {
     request_id: req.requestId,
+    payment_method: req.paymentMethod,
     target_hostname: targetHostname(req.targetUrl),
     status,
     format,
@@ -254,7 +262,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'content-type, payment-signature, x-request-id, authorization',
-  'Access-Control-Expose-Headers': 'payment-required, payment-response, x-request-id',
+  'Access-Control-Expose-Headers': 'payment-required, payment-response, x-request-id, x-credit-balance',
 }
 
 function applyCors(res) {
@@ -270,11 +278,136 @@ app.options('/v1/extract/batch', (req, res) => {
   applyCors(res)
   res.sendStatus(200)
 })
+app.options(['/v1/credits/checkout', '/v1/credits/claim', '/v1/credits/balance'], (req, res) => {
+  applyCors(res)
+  res.sendStatus(200)
+})
 
 // Scoped CORS — only /v1/extract routes and well-known discovery routes
-app.use(['/v1/extract', '/v1/extract/batch', '/.well-known/x402', '/.well-known/x402.json', '/openapi.json'], (req, res, next) => {
+app.use([
+  '/v1/extract',
+  '/v1/extract/batch',
+  '/v1/credits/checkout',
+  '/v1/credits/claim',
+  '/v1/credits/balance',
+  '/.well-known/x402',
+  '/.well-known/x402.json',
+  '/openapi.json',
+], (req, res, next) => {
   applyCors(res)
   next()
+})
+
+function prepaidUnavailable(res) {
+  res.setHeader('Cache-Control', 'private, no-store')
+  return res.status(503).json({
+    error: 'prepaid card checkout is not configured',
+    code: 'prepaid_unavailable',
+  })
+}
+
+function sendCreditError(res, error) {
+  const creditError = error instanceof CreditError
+    ? error
+    : new CreditError('prepaid_internal_error', 'prepaid credit operation failed', 500)
+  res.setHeader('Cache-Control', 'private, no-store')
+  return res.status(creditError.status).json({
+    error: creditError.message,
+    code: creditError.code,
+    ...creditError.details,
+  })
+}
+
+function bearerApiKey(req) {
+  const authorization = req.get('authorization')
+  if (!authorization) return null
+  const match = authorization.match(/^Bearer\s+(\S+)$/i)
+  return match ? match[1] : null
+}
+
+
+app.post(
+  '/v1/credits/stripe-webhook',
+  express.raw({ type: 'application/json', limit: '128kb' }),
+  (req, res) => {
+    if (!creditService) return prepaidUnavailable(res)
+    try {
+      const result = creditService.handleWebhook(req.body, req.get('stripe-signature'))
+      logRequest({
+        ts: new Date().toISOString(),
+        event: 'credit_webhook',
+        duplicate: Boolean(result.duplicate),
+        ignored: Boolean(result.ignored),
+      })
+      return res.json({ received: true })
+    } catch (error) {
+      console.warn(`credit webhook rejected: ${error.message}`)
+      return sendCreditError(res, error instanceof CreditError
+        ? error
+        : new CreditError('invalid_webhook', 'invalid Stripe webhook', 400))
+    }
+  }
+)
+
+function sendCreditCheckout(res) {
+  if (!creditService) return prepaidUnavailable(res)
+  const checkout = creditService.checkout
+  res.setHeader('Cache-Control', 'public, max-age=300')
+  return res.json({
+    checkout_url: checkout.checkoutUrl,
+    credit_units: checkout.units,
+    single_extractions: Math.floor(checkout.units / SINGLE_EXTRACTION_UNITS),
+    price_usd: checkout.amountCents / 100,
+  })
+}
+app.get('/v1/credits/checkout', (_req, res) => sendCreditCheckout(res))
+
+app.post('/v1/credits/claim', express.json({ limit: '2kb' }), (req, res) => {
+  if (!creditService) return prepaidUnavailable(res)
+  try {
+    const apiKey = req.body?.api_key
+    const claim = creditService.ledger.claimCheckout(req.body?.session_id, apiKey)
+    res.setHeader('Cache-Control', 'private, no-store')
+    if (claim.pending) {
+      res.setHeader('Retry-After', '2')
+      return res.status(202).json({ status: 'pending' })
+    }
+    if (!claim.alreadyClaimed) {
+      logRequest({
+        ts: new Date().toISOString(),
+        event: 'credit_key_claimed',
+        key_prefix: apiKey.slice(0, 17),
+        balance_units: claim.balanceUnits,
+      })
+    }
+    return res.json({
+      api_key: apiKey,
+      balance_units: claim.balanceUnits,
+      single_extractions_remaining: Math.floor(claim.balanceUnits / SINGLE_EXTRACTION_UNITS),
+      warning: 'Copy this API key now. Only its hash is stored.',
+    })
+  } catch (error) {
+    return sendCreditError(res, error)
+  }
+})
+app.use('/v1/credits/claim', (error, _req, res, next) => {
+  if (!error) return next()
+  return sendCreditError(res, new CreditError('invalid_json', 'request body must be valid JSON'))
+})
+
+app.get('/v1/credits/balance', (req, res) => {
+  if (!creditService) return prepaidUnavailable(res)
+  try {
+    const key = creditService.ledger.inspectApiKey(bearerApiKey(req))
+    res.setHeader('Cache-Control', 'private, no-store')
+    return res.json({
+      key_prefix: key.keyPrefix,
+      balance_units: key.balanceUnits,
+      single_extractions_remaining: Math.floor(key.balanceUnits / SINGLE_EXTRACTION_UNITS),
+    })
+  } catch (error) {
+    return sendCreditError(res, error)
+  }
 })
 
 function isSuccessfulSettlementHeader(value) {
@@ -390,6 +523,79 @@ app.post('/v1/extract/batch', async (req, res, next) => {
   next()
 })
 
+app.use(['/v1/extract', '/v1/extract/batch'], (req, res, next) => {
+  const authorization = req.get('authorization')
+  if (!authorization) return next()
+  if (!/^Bearer\s/i.test(authorization)) return next()
+  const apiKey = bearerApiKey(req)
+  if (!apiKey) {
+    return sendCreditError(res, new CreditError('invalid_api_key', 'invalid prepaid API key', 401))
+  }
+  if (!creditService) return prepaidUnavailable(res)
+
+  const endpoint = requestEndpoint(req)
+  const units = endpoint === '/v1/extract/batch'
+    ? BATCH_EXTRACTION_UNITS
+    : SINGLE_EXTRACTION_UNITS
+  try {
+    const reservation = creditService.ledger.reserve(
+      apiKey,
+      req.requestId,
+      endpoint,
+      units
+    )
+    req.paymentMethod = 'prepaid'
+    res.setHeader('X-Credit-Balance', String(reservation.balanceUnits))
+    const event = {
+      request_id: req.requestId,
+      endpoint,
+      method: req.method,
+      payment_method: 'prepaid',
+      key_prefix: reservation.keyPrefix,
+      credit_units: units,
+      balance_units: reservation.balanceUnits,
+    }
+    logRequest({ ts: new Date().toISOString(), event: 'credit_reserved', ...event })
+    void umamiEvent('credit-reserved', event, endpoint)
+
+    let finalized = false
+    const finalize = succeeded => {
+      if (finalized) return
+      finalized = true
+      try {
+        const settlement = creditService.ledger.settle(
+          reservation.apiKeyId,
+          req.requestId,
+          succeeded
+        )
+        const settledEvent = {
+          ...event,
+          balance_units: settlement.balanceUnits,
+        }
+        logRequest({
+          ts: new Date().toISOString(),
+          event: succeeded ? 'credit_committed' : 'credit_released',
+          ...settledEvent,
+        })
+        void umamiEvent(
+          succeeded ? 'credit-committed' : 'credit-released',
+          settledEvent,
+          endpoint
+        )
+      } catch (error) {
+        console.error(`credit settlement failed for ${req.requestId}: ${error.message}`)
+      }
+    }
+    res.once('finish', () => finalize(res.statusCode >= 200 && res.statusCode < 300))
+    res.once('close', () => {
+      if (!res.writableFinished) finalize(false)
+    })
+    return next()
+  } catch (error) {
+    return sendCreditError(res, error)
+  }
+})
+
 // x402 v2 payment gate — $0.001 per extraction, $0.005 per batch.
 const facilitatorClient = new HTTPFacilitatorClient(
   process.env.FACILITATOR_URL
@@ -406,7 +612,7 @@ const resourceServer = new x402ResourceServer(facilitatorClient)
 registerExactEvmScheme(resourceServer, { networks: [NETWORK] })
 resourceServer.registerExtension(bazaarResourceServerExtension)
 
-app.use(paymentMiddleware(
+const x402PaymentGate = paymentMiddleware(
   {
     'GET /v1/extract': {
       accepts: {
@@ -514,7 +720,16 @@ app.use(paymentMiddleware(
     },
   },
   resourceServer
-))
+)
+
+app.use((req, res, next) => {
+  if (!requestEndpoint(req)) return next()
+  if (req.paymentMethod === 'prepaid') return next()
+  return x402PaymentGate(req, res, error => {
+    if (!error) req.paymentMethod = 'x402'
+    next(error)
+  })
+})
 
 app.use(['/v1/extract', '/v1/extract/batch'], (req, _res, next) => {
   const endpoint = requestEndpoint(req)
@@ -523,6 +738,7 @@ app.use(['/v1/extract', '/v1/extract/batch'], (req, _res, next) => {
     request_id: req.requestId,
     endpoint,
     method: req.method,
+    payment_method: req.paymentMethod,
   }
   logRequest({ ts: new Date().toISOString(), event: 'payment_authorized', ...event })
   void umamiEvent('payment-authorized', event, endpoint)
@@ -614,8 +830,9 @@ app.get('/v1/extract', async (req, res) => {
     }
     const duration_ms = Date.now() - start
     const target_hostname = targetHostname(targetUrl)
-    logRequest({ ts, event: 'success', request_id: req.requestId, endpoint: '/v1/extract', target_hostname, length: content.length, format, duration_ms })
-    void umamiEvent('extract-request', { request_id: req.requestId, status: 200, target_hostname, format, length: content.length, duration_ms }, '/v1/extract')
+    const event = { request_id: req.requestId, payment_method: req.paymentMethod, status: 200, target_hostname, format, length: content.length, duration_ms }
+    logRequest({ ts, event: 'success', endpoint: '/v1/extract', ...event })
+    void umamiEvent('extract-request', event, '/v1/extract')
     return res.json(result)
   } catch (err) {
     recordSingleFailure(req, format, ts, start, 500, 'internal_error')
@@ -702,11 +919,12 @@ app.post('/v1/extract/batch', async (req, res) => {
     const duration_ms = Date.now() - start
     const failure_count = results.filter(result => result.error).length
     const targetTelemetry = batchTargetTelemetry(urls, results)
-    logRequest({ ts, event: 'success', request_id: req.requestId, endpoint: '/v1/extract/batch', count: urls.length, failure_count, format, duration_ms, ...targetTelemetry })
-    void umamiEvent('extract-batch', { request_id: req.requestId, status: 200, format, count: urls.length, failure_count, duration_ms, ...targetTelemetry }, '/v1/extract/batch')
+    const event = { request_id: req.requestId, payment_method: req.paymentMethod, status: 200, format, count: urls.length, failure_count, duration_ms, ...targetTelemetry }
+    logRequest({ ts, event: 'success', endpoint: '/v1/extract/batch', ...event })
+    void umamiEvent('extract-batch', event, '/v1/extract/batch')
     return res.json({ results })
   } catch (err) {
-    void umamiEvent('extract-batch', { request_id: req.requestId, status: 500, reason: 'internal_error' }, '/v1/extract/batch')
+    void umamiEvent('extract-batch', { request_id: req.requestId, payment_method: req.paymentMethod, status: 500, reason: 'internal_error' }, '/v1/extract/batch')
     return res.status(500).json({ error: err.message })
   }
 })
@@ -716,12 +934,12 @@ const openApiSpec = {
   openapi: '3.0.3',
   info: {
     title: 'extract.dkta.dev',
-    version: '2.0.0',
+    version: '2.1.0',
     description:
-      'Clean content extraction for AI agents. A single request costs **$0.001 USDC** ' +
-      'and a batch of up to 5 URLs costs **$0.005 USDC** on Base mainnet via the ' +
-      '[x402 protocol](https://x402.org). Inputs are validated before the payment challenge. ' +
-      'A single extraction settles only after a successful response. A batch settles on its HTTP 200 response, including when individual items contain inline errors.',
+      'Clean content extraction for AI agents. A single request costs **$0.001** ' +
+      'and a batch of up to 5 URLs costs **$0.005**. Pay per request with USDC on Base through ' +
+      '[x402](https://x402.org), or prepay $10 by card for a bearer API key. Inputs are validated before charging. ' +
+      'A single extraction is charged only after a successful response. A batch is charged on its HTTP 200 response, including when individual items contain inline errors.',
   },
   servers: [{ url: 'https://extract.dkta.dev', description: 'Production' }],
   paths: {
@@ -730,8 +948,8 @@ const openApiSpec = {
         summary: 'Extract readable content from a URL',
         description:
           'Fetches the target URL with Crawl4AI first, then falls back to Mozilla Readability, ' +
-          'and returns structured markdown or plain text. Requires an x402 v2 micropayment ' +
-          '($0.001 USDC on Base mainnet) in the `PAYMENT-SIGNATURE` header.',
+          'and returns structured markdown or plain text. Pay with an x402 v2 micropayment ' +
+          '($0.001 USDC on Base mainnet) or a prepaid bearer API key.',
         operationId: 'extractUrl',
         parameters: [
           {
@@ -756,7 +974,7 @@ const openApiSpec = {
             schema: { type: 'string', format: 'uuid' },
           },
         ],
-        security: [{ x402Payment: [] }],
+        security: [{ x402Payment: [] }, { apiKeyAuth: [] }],
         responses: {
           '200': {
             description: 'Extracted content',
@@ -837,9 +1055,9 @@ const openApiSpec = {
       post: {
         summary: 'Batch extract readable content from multiple URLs',
         description:
-          'Accepts 1 to 5 URLs for a flat **$0.005 USDC** payment and returns an array of results. ' +
-          'The entire input is validated before payment. The HTTP 200 response settles the full batch payment, ' +
-          'including when per-URL upstream or extraction errors are returned inline.',
+          'Accepts 1 to 5 URLs for a flat **$0.005** charge and returns an array of results. ' +
+          'Use x402 on Base or a prepaid bearer API key. The entire input is validated before charging. ' +
+          'The HTTP 200 response incurs the full batch charge, including when per-URL upstream or extraction errors are returned inline.',
         operationId: 'extractBatch',
         parameters: [
           {
@@ -850,7 +1068,7 @@ const openApiSpec = {
             schema: { type: 'string', format: 'uuid' },
           },
         ],
-        security: [{ x402Payment: [] }],
+        security: [{ x402Payment: [] }, { apiKeyAuth: [] }],
         requestBody: {
           required: true,
           content: {
@@ -934,6 +1152,87 @@ const openApiSpec = {
         },
       },
     },
+    '/v1/credits/checkout': {
+      get: {
+        summary: 'Get the prepaid credit package and Stripe Payment Link',
+        operationId: 'getCreditCheckout',
+        responses: {
+          '200': {
+            description: 'Reusable Stripe-hosted checkout URL and package terms',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    checkout_url: { type: 'string', format: 'uri' },
+                    credit_units: { type: 'integer', example: 10000000 },
+                    single_extractions: { type: 'integer', example: 10000 },
+                    price_usd: { type: 'number', example: 10 },
+                  },
+                  required: ['checkout_url', 'credit_units', 'single_extractions', 'price_usd'],
+                },
+              },
+            },
+          },
+          '503': { description: 'Prepaid checkout is not configured' },
+        },
+      },
+    },
+    '/v1/credits/claim': {
+      post: {
+        summary: 'Bind client-generated API key material to a paid Checkout Session',
+        description: 'Generate one API key and submit the same candidate on every retry. The server persists only its hash, making a lost HTTP response safely retryable. The success page handles this automatically.',
+        operationId: 'claimCreditCheckout',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  session_id: { type: 'string', pattern: '^cs_', description: 'Stripe Checkout Session ID from the Payment Link redirect' },
+                  api_key: { type: 'string', pattern: '^ext_live_[A-Za-z0-9_-]{43}$', description: 'Client-generated 256-bit API key candidate' },
+                },
+                required: ['session_id', 'api_key'],
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'The accepted API key candidate and prepaid balance',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    api_key: { type: 'string', description: 'Echoes the accepted candidate; copy it before leaving the success page' },
+                    balance_units: { type: 'integer' },
+                    single_extractions_remaining: { type: 'integer' },
+                    warning: { type: 'string' },
+                  },
+                  required: ['api_key', 'balance_units', 'single_extractions_remaining', 'warning'],
+                },
+              },
+            },
+          },
+          '202': { description: 'Stripe webhook fulfillment is still pending' },
+          '404': { description: 'The paid Checkout Session is not available yet or was reversed' },
+          '409': { description: 'The Checkout Session was already claimed with different key material' },
+        },
+      },
+    },
+    '/v1/credits/balance': {
+      get: {
+        summary: 'Read the remaining prepaid balance',
+        operationId: 'getCreditBalance',
+        security: [{ apiKeyAuth: [] }],
+        responses: {
+          '200': { description: 'Remaining credit units and equivalent request counts' },
+          '401': { description: 'Missing or invalid API key' },
+        },
+      },
+    },
     '/openapi.json': {
       get: {
         summary: 'OpenAPI specification',
@@ -962,6 +1261,11 @@ const openApiSpec = {
         description:
           'x402 v2 signed payment header from an x402-compatible wallet client such as `@x402/fetch`. ' +
           `Single requests authorize $0.001 USDC and batches authorize $0.005 USDC on Base mainnet (\`${NETWORK}\`), payable to \`${PAYMENT_ADDRESS}\`.`,
+      },
+      apiKeyAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        description: 'Prepaid Extract API key returned once after Stripe Checkout.',
       },
     },
     schemas: {
@@ -1146,6 +1450,103 @@ app.get('/robots.txt', (_req, res) => {
 Allow: /
 Sitemap: https://extract.dkta.dev/sitemap.xml
 `)
+})
+
+app.get('/credits/success', (_req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+  )
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>Claim Extract API key</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0a0a0a; color: #f0f0f0; }
+    main { width: min(620px, calc(100% - 32px)); padding: 32px; box-sizing: border-box; background: #111; border: 1px solid #2a2a2a; border-radius: 12px; }
+    h1 { margin: 0 0 12px; font-size: 26px; }
+    p { color: #aaa; line-height: 1.6; }
+    code { display: block; padding: 16px; overflow-wrap: anywhere; background: #0a0a0a; border: 1px solid #2a2a2a; border-radius: 8px; color: #8db6ff; }
+    button, a { display: inline-block; margin: 16px 8px 0 0; padding: 10px 14px; border: 0; border-radius: 6px; background: #1a6bff; color: white; text-decoration: none; cursor: pointer; }
+    a { background: #292929; }
+    .warning { color: #f5a623; }
+    .error { color: #ff7b7b; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Claim your Extract API key</h1>
+    <p id="status">Confirming your payment…</p>
+    <section id="result" hidden>
+      <p class="warning">Copy this key now. It is stored only as a hash and cannot be shown again.</p>
+      <code id="api-key"></code>
+      <button id="copy" type="button">Copy API key</button>
+      <a href="/docs">Open API docs</a>
+    </section>
+  </main>
+  <script>
+    const status = document.getElementById('status');
+    const result = document.getElementById('result');
+    const apiKey = document.getElementById('api-key');
+    const sessionId = new URLSearchParams(location.search).get('session_id');
+    const claimStorageKey = sessionId ? 'extract:claim:' + sessionId : null;
+    let candidateApiKey = claimStorageKey ? sessionStorage.getItem(claimStorageKey) : null;
+    if (sessionId && !/^ext_live_[A-Za-z0-9_-]{43}$/.test(candidateApiKey || '')) {
+      const bytes = crypto.getRandomValues(new Uint8Array(32));
+      const token = btoa(String.fromCharCode(...bytes))
+        .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+      candidateApiKey = 'ext_live_' + token;
+      sessionStorage.setItem(claimStorageKey, candidateApiKey);
+    }
+    async function claim(attempt = 0) {
+      if (!sessionId) {
+        status.className = 'error';
+        status.textContent = 'Missing Checkout Session ID. Use the redirect from Stripe Checkout.';
+        return;
+      }
+      try {
+        const response = await fetch('/v1/credits/claim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId, api_key: candidateApiKey })
+        });
+        const body = await response.json();
+        if (
+          attempt < 30 &&
+          (response.status === 202 || (response.status === 404 && body.code === 'checkout_not_found'))
+        ) {
+          status.textContent = 'Payment received. Preparing your API key…';
+          setTimeout(() => claim(attempt + 1), 2000);
+          return;
+        }
+        if (!response.ok) throw new Error(body.error || 'Unable to claim API key');
+        apiKey.textContent = body.api_key;
+        status.textContent = body.single_extractions_remaining
+          ? body.single_extractions_remaining.toLocaleString() + ' single extractions available.'
+          : '10,000 single extractions available.';
+        result.hidden = false;
+      } catch (error) {
+        status.className = 'error';
+        status.textContent = error.message;
+      }
+    }
+    document.getElementById('copy').addEventListener('click', async event => {
+      const button = event.currentTarget;
+      await navigator.clipboard.writeText(apiKey.textContent);
+      sessionStorage.removeItem(claimStorageKey);
+      history.replaceState({}, '', '/credits/success');
+      button.textContent = 'Copied';
+    });
+    claim();
+  </script>
+</body>
+</html>`)
 })
 
 app.get('/', (_req, res) => {
@@ -1592,6 +1993,38 @@ app.get('/', (_req, res) => {
       font-size: 12px;
       color: var(--text-tertiary);
     }
+    .prepaid-option {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-5);
+      margin-bottom: var(--space-6);
+      padding: var(--space-5);
+      border: 1px solid var(--border-mid);
+      border-radius: var(--radius-md);
+      background: var(--bg-code);
+    }
+    .prepaid-option strong {
+      display: block;
+      margin-bottom: var(--space-1);
+      color: var(--text-primary);
+      font-size: 14px;
+    }
+    .prepaid-option span {
+      color: var(--text-tertiary);
+      font-size: 12px;
+    }
+    .prepaid-button {
+      flex-shrink: 0;
+      padding: 9px 14px;
+      border-radius: var(--radius-sm);
+      background: var(--accent);
+      color: white;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.15s;
+    }
+    .prepaid-button:hover { background: var(--accent-hover); }
     .chain-logo {
       display: flex;
       align-items: center;
@@ -1743,6 +2176,7 @@ app.get('/', (_req, res) => {
       .response-grid { grid-template-columns: 1fr; }
       .agent-links { grid-template-columns: 1fr; }
       .pricing-details { grid-template-columns: 1fr; }
+      .prepaid-option { flex-direction: column; align-items: flex-start; }
       .footer-inner { flex-direction: column; align-items: flex-start; gap: var(--space-4); }
       .hero { padding: var(--space-16) 0 var(--space-12); }
       .section { padding: var(--space-12) 0; }
@@ -1965,7 +2399,7 @@ Host: extract.dkta.dev</span></pre>
     <div class="container">
       <p class="section-label">Pricing</p>
       <h2>Simple math.</h2>
-      <p class="section-sub">No tiers, credits, minimums, or expiry. Batch pricing is a flat $0.005 for 1 to 5 URLs.</p>
+      <p class="section-sub">Pay per request with x402, or buy an optional $10 prepaid API key by card. No account or subscription.</p>
       <div class="pricing-card">
         <div class="price-display">
           <span class="price-amount">$0.001</span>
@@ -1976,16 +2410,26 @@ Host: extract.dkta.dev</span></pre>
         <div class="pricing-details">
           <div class="pricing-detail"><span class="check">✓</span> No account required</div>
           <div class="pricing-detail"><span class="check">✓</span> No subscription</div>
-          <div class="pricing-detail"><span class="check">✓</span> No minimum spend</div>
-          <div class="pricing-detail"><span class="check">✓</span> Input checked before payment</div>
-          <div class="pricing-detail"><span class="check">✓</span> No API key needed</div>
-          <div class="pricing-detail"><span class="check">✓</span> Pay per use, stop anytime</div>
+          <div class="pricing-detail"><span class="check">✓</span> x402 has no minimum spend</div>
+          <div class="pricing-detail"><span class="check">✓</span> Input checked before charging</div>
+          <div class="pricing-detail"><span class="check">✓</span> Wallet path needs no API key</div>
+          <div class="pricing-detail"><span class="check">✓</span> Optional card-funded API key</div>
         </div>
+
+        ${creditService ? `
+        <div class="prepaid-option">
+          <div>
+            <strong>Pay by card, use an API key</strong>
+            <span>$10 prepays 10,000 single requests. The key is shown once after checkout.</span>
+          </div>
+          <a class="prepaid-button" href="${creditService.checkout.checkoutUrl}" rel="noreferrer" data-umami-event="prepaid-checkout">Buy credits →</a>
+        </div>
+        ` : ''}
 
         <div class="pricing-chain">
           <div class="chain-logo">
             <div class="chain-dot"></div>
-            Paid via x402 on Base network
+            Paid via x402 on Base or Stripe-hosted prepaid checkout
           </div>
           <span>·</span>
           <a href="https://x402.org" style="color: var(--text-tertiary); transition: color 0.15s;" onmouseover="this.style.color='var(--text-secondary)'" onmouseout="this.style.color='var(--text-tertiary)'">x402.org ↗</a>
@@ -2117,5 +2561,11 @@ const server = app.listen(PORT, () => {
 // Keep event loop alive under systemd (no TTY)
 setInterval(() => {}, 1 << 30)
 
-process.on('SIGTERM', () => { server.close(() => process.exit(0)) })
-process.on('SIGINT', () => { server.close(() => process.exit(0)) })
+function shutdown() {
+  server.close(() => {
+    creditService?.close()
+    process.exit(0)
+  })
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)

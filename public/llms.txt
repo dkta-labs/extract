@@ -1,12 +1,12 @@
 # extract.dkta.dev
 
-> Clean content extraction for AI agents. Pay per call via x402 on Base.
+> Clean content extraction for AI agents. Pay per request with x402 on Base, or prepay by card for a bearer API key.
 
 ## API
 
 ### GET /v1/extract?url=<url>&format=<markdown|text>
 
-Returns structured content extracted from a public HTTP(S) URL. Requires an x402 v2 micropayment of $0.001 USDC on Base mainnet in the `PAYMENT-SIGNATURE` header.
+Returns structured content extracted from a public HTTP(S) URL. Authorize with either an x402 v2 micropayment of $0.001 USDC on Base mainnet or a prepaid bearer API key.
 
 **Response:**
 
@@ -26,7 +26,7 @@ Returns structured content extracted from a public HTTP(S) URL. Requires an x402
 
 ### POST /v1/extract/batch
 
-Batch extract 1 to 5 URLs for a flat x402 micropayment of $0.005 USDC on Base mainnet.
+Batch extract 1 to 5 URLs for a flat $0.005 charge, authorized with x402 on Base or a prepaid bearer API key.
 
 **Request body:**
 
@@ -74,7 +74,7 @@ The batch returns HTTP 200 and settles the flat payment even when per-URL upstre
 - `lang` — detected language code (e.g. `"en"`, `"zh"`)
 - `error` — present only on per-URL batch failures
 
-## Payment
+## x402 payment
 
 Use an x402 v2 client with a self-custodied or managed USDC wallet on Base mainnet (`eip155:8453`). The free HTTP 402 response carries base64 payment requirements and Bazaar discovery metadata in `PAYMENT-REQUIRED`; clients retry with `PAYMENT-SIGNATURE`. Send the same client-generated UUID as `X-Request-ID` on the initial request and paid retry.
 
@@ -106,16 +106,27 @@ const batchRes = await paidFetch('https://extract.dkta.dev/v1/extract/batch', {
 const { results } = await batchRes.json()
 ```
 
+## Prepaid API key
+
+`GET /v1/credits/checkout` returns a reusable Stripe Payment Link for the optional $10 package. It buys 10,000 single extractions, 2,000 batch requests, or any equivalent mix. The success page generates a 256-bit `ext_live_...` candidate locally and submits `{ "session_id": "...", "api_key": "ext_live_..." }` to `POST /v1/credits/claim`. Retry with the same candidate if the response is interrupted; the server stores only its hash. Use the accepted key as:
+
+```http
+Authorization: Bearer ext_live_...
+```
+
+`GET /v1/credits/balance` returns the remaining integer credit units and equivalent request counts. Credits do not expire. Never place the key in a URL or client-side application.
+
 ## Validation and billing
 
-- Request shape, format, URL scheme, credentials, DNS resolution, and direct private/link-local targets are checked before the payment challenge.
-- A single extraction settles only after a successful response; a 4xx/5xx single-extraction response is not settled. A batch settles on its HTTP 200 response, including when individual results contain inline errors.
+- Request shape, format, URL scheme, credentials, DNS resolution, and direct private/link-local targets are checked before either payment path.
+- A single extraction incurs a charge only after success: x402 settlement is skipped and prepaid credits are released on 4xx/5xx. A batch incurs its flat charge on HTTP 200, including when individual results contain inline errors.
 - Readability fetches pin a validated public address on every redirect hop. The Crawl4AI worker is independently restricted from private and non-routable destinations at the host firewall.
 
 ## Pricing
 
-- Single extraction: $0.001 USDC per request
-- Batch extraction (1 to 5 URLs): $0.005 USDC flat per request
+- Single extraction: $0.001 USDC via x402, or 1,000 prepaid units
+- Batch extraction (1 to 5 URLs): $0.005 USDC via x402, or 5,000 prepaid units
+- Optional prepaid package: $10 USD for 10,000,000 units; no subscription or expiry
 
 ## Docs
 - OpenAPI spec: https://extract.dkta.dev/openapi.json
