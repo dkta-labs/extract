@@ -64,7 +64,7 @@ jobs:
             kill "$facilitator_pid" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
-          curl --fail --retry 10 --retry-delay 1 --silent http://127.0.0.1:17402/supported >/dev/null
+          curl --fail --retry 10 --retry-connrefused --retry-delay 1 --silent http://127.0.0.1:17402/supported >/dev/null
           docker run --detach --name extract-oci --publish 127.0.0.1:3721:3721 \
             --add-host host.docker.internal:host-gateway \
             --env PAYMENT_ADDRESS=0x0000000000000000000000000000000000000001 \
