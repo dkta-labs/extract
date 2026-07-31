@@ -278,7 +278,7 @@ app.options('/v1/extract/batch', (req, res) => {
   applyCors(res)
   res.sendStatus(200)
 })
-app.options(['/v1/credits/checkout', '/v1/credits/claim', '/v1/credits/balance'], (req, res) => {
+app.options(['/v1/credits/checkout', '/v1/credits/claim', '/v1/credits/balance', '/v1/credits/topups'], (req, res) => {
   applyCors(res)
   res.sendStatus(200)
 })
@@ -290,6 +290,7 @@ app.use([
   '/v1/credits/checkout',
   '/v1/credits/claim',
   '/v1/credits/balance',
+  '/v1/credits/topups',
   '/.well-known/x402',
   '/.well-known/x402.json',
   '/openapi.json',
@@ -338,6 +339,7 @@ app.post(
         event: 'credit_webhook',
         duplicate: Boolean(result.duplicate),
         ignored: Boolean(result.ignored),
+        topped_up: Boolean(result.toppedUp),
       })
       return res.json({ received: true })
     } catch (error) {
@@ -362,12 +364,43 @@ function sendCreditCheckout(res) {
 }
 app.get('/v1/credits/checkout', (_req, res) => sendCreditCheckout(res))
 
+app.post('/v1/credits/topups', (req, res) => {
+  if (!creditService) return prepaidUnavailable(res)
+  try {
+    const topup = creditService.createTopUpCheckout(bearerApiKey(req))
+    res.setHeader('Cache-Control', 'private, no-store')
+    logRequest({
+      ts: new Date().toISOString(),
+      event: 'credit_topup_intent_created',
+      key_prefix: topup.keyPrefix,
+      credit_units: topup.units,
+    })
+    return res.status(201).json({
+      checkout_url: topup.checkoutUrl,
+      credit_units: topup.units,
+      single_extractions: Math.floor(topup.units / SINGLE_EXTRACTION_UNITS),
+      price_usd: topup.amountCents / 100,
+    })
+  } catch (error) {
+    return sendCreditError(res, error)
+  }
+})
+
 app.post('/v1/credits/claim', express.json({ limit: '2kb' }), (req, res) => {
   if (!creditService) return prepaidUnavailable(res)
   try {
     const apiKey = req.body?.api_key
     const claim = creditService.ledger.claimCheckout(req.body?.session_id, apiKey)
     res.setHeader('Cache-Control', 'private, no-store')
+    if (claim.toppedUp) {
+      return res.json({
+        topped_up: true,
+        key_prefix: claim.keyPrefix,
+        credit_units_added: claim.creditUnits,
+        balance_units: claim.balanceUnits,
+        single_extractions_remaining: Math.floor(claim.balanceUnits / SINGLE_EXTRACTION_UNITS),
+      })
+    }
     if (!claim.alreadyClaimed) {
       logRequest({
         ts: new Date().toISOString(),
@@ -930,7 +963,7 @@ const openApiSpec = {
   openapi: '3.0.3',
   info: {
     title: 'extract.dkta.dev',
-    version: '2.1.0',
+    version: '2.2.0',
     description:
       'Clean content extraction for AI agents. A single request costs **$0.001** ' +
       'and a batch of up to 5 URLs costs **$0.005**. Pay per request with USDC on Base through ' +
@@ -1174,10 +1207,40 @@ const openApiSpec = {
         },
       },
     },
+    '/v1/credits/topups': {
+      post: {
+        summary: 'Create a checkout that tops up the authenticated API key',
+        description: 'Authenticates the existing bearer key and returns the reusable Stripe Payment Link with a random opaque reference bound to that key. Neither the API key nor its hash is sent to Stripe. Every successfully paid Checkout Session carrying the reference credits the same key; session and PaymentIntent IDs remain idempotent.',
+        operationId: 'createCreditTopUp',
+        security: [{ apiKeyAuth: [] }],
+        responses: {
+          '201': {
+            description: 'Top-up checkout URL and package terms',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    checkout_url: { type: 'string', format: 'uri' },
+                    credit_units: { type: 'integer', example: 10000000 },
+                    single_extractions: { type: 'integer', example: 10000 },
+                    price_usd: { type: 'number', example: 10 },
+                  },
+                  required: ['checkout_url', 'credit_units', 'single_extractions', 'price_usd'],
+                },
+              },
+            },
+          },
+          '401': { description: 'Missing or invalid API key' },
+          '403': { description: 'API key is suspended pending payment review' },
+          '503': { description: 'Prepaid checkout is not configured' },
+        },
+      },
+    },
     '/v1/credits/claim': {
       post: {
-        summary: 'Bind client-generated API key material to a paid Checkout Session',
-        description: 'Generate one API key and submit the same candidate on every retry. The server persists only its hash, making a lost HTTP response safely retryable. The success page handles this automatically.',
+        summary: 'Complete a prepaid Checkout Session',
+        description: 'For a new key purchase, generate one API key and submit the same candidate on every retry; the server persists only its hash. For an existing-key top-up, omit api_key to retrieve the completed top-up result. The success page handles both flows automatically.',
         operationId: 'claimCreditCheckout',
         requestBody: {
           required: true,
@@ -1187,31 +1250,47 @@ const openApiSpec = {
                 type: 'object',
                 properties: {
                   session_id: { type: 'string', pattern: '^cs_', description: 'Stripe Checkout Session ID from the Payment Link redirect' },
-                  api_key: { type: 'string', pattern: '^ext_live_[A-Za-z0-9_-]{43}$', description: 'Client-generated 256-bit API key candidate' },
+                  api_key: { type: 'string', pattern: '^ext_live_[A-Za-z0-9_-]{43}$', description: 'Client-generated 256-bit API key candidate, required only for a new-key purchase' },
                 },
-                required: ['session_id', 'api_key'],
+                required: ['session_id'],
               },
             },
           },
         },
         responses: {
           '200': {
-            description: 'The accepted API key candidate and prepaid balance',
+            description: 'A newly claimed API key or completed existing-key top-up',
             content: {
               'application/json': {
                 schema: {
-                  type: 'object',
-                  properties: {
-                    api_key: { type: 'string', description: 'Echoes the accepted candidate; copy it before leaving the success page' },
-                    balance_units: { type: 'integer' },
-                    single_extractions_remaining: { type: 'integer' },
-                    warning: { type: 'string' },
-                  },
-                  required: ['api_key', 'balance_units', 'single_extractions_remaining', 'warning'],
+                  oneOf: [
+                    {
+                      type: 'object',
+                      properties: {
+                        api_key: { type: 'string', description: 'Echoes the accepted candidate; copy it before leaving the success page' },
+                        balance_units: { type: 'integer' },
+                        single_extractions_remaining: { type: 'integer' },
+                        warning: { type: 'string' },
+                      },
+                      required: ['api_key', 'balance_units', 'single_extractions_remaining', 'warning'],
+                    },
+                    {
+                      type: 'object',
+                      properties: {
+                        topped_up: { type: 'boolean', enum: [true] },
+                        key_prefix: { type: 'string' },
+                        credit_units_added: { type: 'integer' },
+                        balance_units: { type: 'integer' },
+                        single_extractions_remaining: { type: 'integer' },
+                      },
+                      required: ['topped_up', 'key_prefix', 'credit_units_added', 'balance_units', 'single_extractions_remaining'],
+                    },
+                  ],
                 },
               },
             },
           },
+          '400': { description: 'A new-key purchase is ready but api_key is missing or invalid' },
           '404': { description: 'The paid Checkout Session is not available yet or was reversed' },
           '409': { description: 'The Checkout Session was already claimed with different key material' },
         },
@@ -1447,6 +1526,80 @@ Sitemap: https://extract.dkta.dev/sitemap.xml
 `)
 })
 
+app.get('/credits/topup', (_req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  )
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>Top up an Extract API key</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0a0a0a; color: #f0f0f0; }
+    main { width: min(620px, calc(100% - 32px)); padding: 32px; box-sizing: border-box; background: #111; border: 1px solid #2a2a2a; border-radius: 12px; }
+    h1 { margin: 0 0 12px; font-size: 26px; }
+    p { color: #aaa; line-height: 1.6; }
+    label { display: block; margin: 24px 0 8px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #393939; border-radius: 6px; background: #0a0a0a; color: #f0f0f0; font: 14px ui-monospace, monospace; }
+    button, a { display: inline-block; margin: 16px 8px 0 0; padding: 10px 14px; border: 0; border-radius: 6px; background: #1a6bff; color: white; text-decoration: none; cursor: pointer; }
+    button:disabled { cursor: wait; opacity: 0.65; }
+    a { background: #292929; }
+    .privacy { font-size: 14px; }
+    .error { color: #ff7b7b; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Top up an existing API key</h1>
+    <p>Add 10,000 single extractions for $10. Your deployed key stays the same.</p>
+    <form id="topup-form">
+      <label for="api-key">Existing API key</label>
+      <input id="api-key" name="api-key" type="password" required
+        pattern="ext_live_[A-Za-z0-9_-]{43}" autocomplete="off"
+        autocapitalize="none" spellcheck="false">
+      <button id="continue" type="submit">Continue to Stripe</button>
+      <a href="/">Cancel</a>
+    </form>
+    <p class="privacy">The key is sent only to Extract over HTTPS. Stripe receives a random reference bound to this key—not the key or its hash. Every paid use of the checkout link funds this same key.</p>
+    <p id="status" role="status"></p>
+  </main>
+  <script>
+    const form = document.getElementById('topup-form');
+    const apiKey = document.getElementById('api-key');
+    const button = document.getElementById('continue');
+    const status = document.getElementById('status');
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      button.disabled = true;
+      status.className = '';
+      status.textContent = 'Creating a secure checkout…';
+      try {
+        const response = await fetch('/v1/credits/topups', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + apiKey.value }
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || 'Unable to create top-up checkout');
+        apiKey.value = '';
+        location.assign(body.checkout_url);
+      } catch (error) {
+        status.className = 'error';
+        status.textContent = error.message;
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>`)
+})
+
 app.get('/credits/success', (_req, res) => {
   res.setHeader('Cache-Control', 'private, no-store')
   res.setHeader('Referrer-Policy', 'no-referrer')
@@ -1460,7 +1613,7 @@ app.get('/credits/success', (_req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex,nofollow,noarchive">
-  <title>Claim Extract API key</title>
+  <title>Complete Extract credits</title>
   <style>
     :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
     body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0a0a0a; color: #f0f0f0; }
@@ -1476,23 +1629,31 @@ app.get('/credits/success', (_req, res) => {
 </head>
 <body>
   <main>
-    <h1>Claim your Extract API key</h1>
+    <h1 id="heading">Complete your Extract purchase</h1>
     <p id="status">Confirming your payment…</p>
-    <section id="result" hidden>
+    <section id="key-result" hidden>
       <p class="warning">Copy this key now. It is stored only as a hash and cannot be shown again.</p>
       <code id="api-key"></code>
       <button id="copy" type="button">Copy API key</button>
       <a href="/docs">Open API docs</a>
     </section>
+    <section id="topup-result" hidden>
+      <p>Your existing credential remains unchanged:</p>
+      <code id="key-prefix"></code>
+      <a href="/docs">Open API docs</a>
+    </section>
   </main>
   <script>
+    const heading = document.getElementById('heading');
     const status = document.getElementById('status');
-    const result = document.getElementById('result');
+    const keyResult = document.getElementById('key-result');
+    const topupResult = document.getElementById('topup-result');
     const apiKey = document.getElementById('api-key');
+    const keyPrefix = document.getElementById('key-prefix');
     const sessionId = new URLSearchParams(location.search).get('session_id');
     const claimStorageKey = sessionId ? 'extract:claim:' + sessionId : null;
     let candidateApiKey = claimStorageKey ? sessionStorage.getItem(claimStorageKey) : null;
-    if (sessionId && !/^ext_live_[A-Za-z0-9_-]{43}$/.test(candidateApiKey || '')) {
+    function createCandidate() {
       const bytes = crypto.getRandomValues(new Uint8Array(32));
       const token = btoa(String.fromCharCode(...bytes))
         .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
@@ -1506,26 +1667,51 @@ app.get('/credits/success', (_req, res) => {
         return;
       }
       try {
+        const payload = { session_id: sessionId };
+        if (/^ext_live_[A-Za-z0-9_-]{43}$/.test(candidateApiKey || '')) {
+          payload.api_key = candidateApiKey;
+        }
         const response = await fetch('/v1/credits/claim', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sessionId, api_key: candidateApiKey })
+          body: JSON.stringify(payload)
         });
         const body = await response.json();
         if (
           attempt < 30 &&
           response.status === 404 && body.code === 'checkout_not_found'
         ) {
-          status.textContent = 'Payment received. Preparing your API key…';
+          status.textContent = 'Payment received. Waiting for Stripe confirmation…';
           setTimeout(() => claim(attempt + 1), 2000);
           return;
         }
-        if (!response.ok) throw new Error(body.error || 'Unable to claim API key');
+        if (
+          response.status === 400 &&
+          body.code === 'invalid_api_key' &&
+          !candidateApiKey
+        ) {
+          createCandidate();
+          return claim(attempt);
+        }
+        if (!response.ok) throw new Error(body.error || 'Unable to complete credit purchase');
+        if (body.topped_up) {
+          heading.textContent = 'API key topped up';
+          status.textContent = body.credit_units_added.toLocaleString() +
+            ' credit units added. ' +
+            body.single_extractions_remaining.toLocaleString() +
+            ' single extractions now available.';
+          keyPrefix.textContent = body.key_prefix + '…';
+          topupResult.hidden = false;
+          sessionStorage.removeItem(claimStorageKey);
+          history.replaceState({}, '', '/credits/success');
+          return;
+        }
+        heading.textContent = 'Claim your Extract API key';
         apiKey.textContent = body.api_key;
         status.textContent = body.single_extractions_remaining
           ? body.single_extractions_remaining.toLocaleString() + ' single extractions available.'
           : '10,000 single extractions available.';
-        result.hidden = false;
+        keyResult.hidden = false;
       } catch (error) {
         status.className = 'error';
         status.textContent = error.message;
@@ -2009,6 +2195,11 @@ app.get('/', (_req, res) => {
       color: var(--text-tertiary);
       font-size: 12px;
     }
+    .prepaid-actions {
+      display: flex;
+      flex-shrink: 0;
+      gap: var(--space-2);
+    }
     .prepaid-button {
       flex-shrink: 0;
       padding: 9px 14px;
@@ -2020,6 +2211,8 @@ app.get('/', (_req, res) => {
       transition: background 0.15s;
     }
     .prepaid-button:hover { background: var(--accent-hover); }
+    .prepaid-button.secondary { background: var(--bg-raised); border: 1px solid var(--border-mid); }
+    .prepaid-button.secondary:hover { background: var(--bg-overlay); }
     .chain-logo {
       display: flex;
       align-items: center;
@@ -2415,9 +2608,12 @@ Host: extract.dkta.dev</span></pre>
         <div class="prepaid-option">
           <div>
             <strong>Pay by card, use an API key</strong>
-            <span>$10 prepays 10,000 single requests. The key is shown once after checkout.</span>
+            <span>$10 adds 10,000 single requests to a new or existing key.</span>
           </div>
-          <a class="prepaid-button" href="${creditService.checkout.checkoutUrl}" rel="noreferrer" data-umami-event="prepaid-checkout">Buy credits →</a>
+          <div class="prepaid-actions">
+            <a class="prepaid-button" href="${creditService.checkout.checkoutUrl}" rel="noreferrer" data-umami-event="prepaid-checkout-new">Buy new key →</a>
+            <a class="prepaid-button secondary" href="/credits/topup" data-umami-event="prepaid-topup-start">Top up existing →</a>
+        </div>
         </div>
         ` : ''}
 

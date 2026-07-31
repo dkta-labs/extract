@@ -252,7 +252,7 @@ test('serves healthy discovery and truthful public contracts', async () => {
   assert.match(javascriptExample, /globalThis\.crypto\.randomUUID\(\)/)
 
   const spec = await (await fetch(`${baseUrl}/openapi.json`)).json()
-  assert.equal(spec.info.version, '2.1.0')
+  assert.equal(spec.info.version, '2.2.0')
   assert.equal(spec.components.securitySchemes.x402Payment.description.includes(PAYMENT_ADDRESS), true)
   assert.equal(JSON.stringify(spec).includes('X-RateLimit-Limit'), false)
   assert.equal(spec.paths['/v1/extract'].get.parameters.at(-1).schema.format, 'uuid')
@@ -261,6 +261,7 @@ test('serves healthy discovery and truthful public contracts', async () => {
   assert.equal(spec.paths['/v1/extract/batch'].post.responses['402'].headers['X-Request-ID'].schema.format, 'uuid')
   assert.equal(spec.paths['/v1/extract'].get.responses['200'].headers['PAYMENT-RESPONSE'].schema.type, 'string')
   assert.equal(spec.paths['/v1/extract/batch'].post.responses['200'].headers['PAYMENT-RESPONSE'].schema.type, 'string')
+  assert.deepEqual(spec.paths['/v1/credits/topups'].post.security, [{ apiKeyAuth: [] }])
   assert.deepEqual(
     spec.paths['/v1/extract'].get.responses['200'].content['application/json'].schema.required,
     ['title', 'byline', 'url', 'content', 'length', 'word_count', 'extraction_method', 'lang']
@@ -295,6 +296,16 @@ test('handles redirect-before-webhook and spends prepaid credits with an API key
       window.fetch = async (_url, options) => {
         const body = JSON.parse(options.body)
         browserClaims.push(body)
+        if (!body.api_key) {
+          return {
+            status: 400,
+            ok: false,
+            json: async () => ({
+              error: 'a valid client-generated API key is required',
+              code: 'invalid_api_key',
+            }),
+          }
+        }
         return {
           status: 200,
           ok: true,
@@ -311,10 +322,11 @@ test('handles redirect-before-webhook and spends prepaid credits with an API key
     },
   })
   try {
-    for (let attempt = 0; attempt < 50 && browserClaims.length < 1; attempt += 1) {
+    for (let attempt = 0; attempt < 50 && browserClaims.length < 2; attempt += 1) {
       await new Promise(resolve => setTimeout(resolve, 10))
     }
-    const browserCandidate = browserClaims[0]?.api_key
+    assert.deepEqual(browserClaims[0], { session_id: 'cs_test_browsercontract' })
+    const browserCandidate = browserClaims[1]?.api_key
     assert.match(browserCandidate, /^ext_live_[A-Za-z0-9_-]{43}$/)
     assert.equal(
       successDom.window.sessionStorage.getItem('extract:claim:cs_test_browsercontract'),
@@ -323,7 +335,7 @@ test('handles redirect-before-webhook and spends prepaid credits with an API key
     assert.equal(successDom.window.location.search, '?session_id=cs_test_browsercontract')
 
     await successDom.window.claim()
-    assert.equal(browserClaims[1].api_key, browserCandidate)
+    assert.equal(browserClaims[2].api_key, browserCandidate)
     successDom.window.document.getElementById('copy').click()
     for (
       let attempt = 0;
@@ -429,6 +441,84 @@ test('handles redirect-before-webhook and spends prepaid credits with an API key
   })
   assert.equal(balance.status, 200)
   assert.equal((await balance.json()).single_extractions_remaining, 9_999)
+
+  const topupPage = await fetch(`${baseUrl}/credits/topup`)
+  const topupHtml = await topupPage.text()
+  assert.equal(topupPage.status, 200)
+  assert.equal(topupPage.headers.get('referrer-policy'), 'no-referrer')
+  assert.match(topupPage.headers.get('cache-control'), /no-store/)
+  assert.match(topupHtml, /Top up an existing API key/)
+  assert.match(topupHtml, /random reference bound to this key/)
+  assert.doesNotMatch(topupHtml, /analytics\.dkta|fonts\.googleapis/)
+
+  const topupCheckout = await fetch(`${baseUrl}/v1/credits/topups`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${claim.api_key}` },
+  })
+  assert.equal(topupCheckout.status, 201)
+  assert.match(topupCheckout.headers.get('cache-control'), /no-store/)
+  const topup = await topupCheckout.json()
+  const topupUrl = new URL(topup.checkout_url)
+  const topupReference = topupUrl.searchParams.get('client_reference_id')
+  assert.equal(`${topupUrl.origin}${topupUrl.pathname}`, STRIPE_PAYMENT_LINK_URL)
+  assert.deepEqual([...topupUrl.searchParams.keys()], ['client_reference_id'])
+  assert.match(topupReference, /^topup_[A-Za-z0-9_-]{43}$/)
+  assert.equal(topup.credit_units, 10_000_000)
+  assert.equal(topup.single_extractions, 10_000)
+  assert.equal(topup.price_usd, 10)
+  assert.equal(topup.checkout_url.includes(claim.api_key), false)
+  assert.equal(topup.checkout_url.includes(claim.api_key.slice(0, 17)), false)
+
+  const topupSessionId = 'cs_test_existing_key_topup'
+  const topupPayload = JSON.stringify({
+    id: 'evt_existing_key_topup',
+    object: 'event',
+    type: 'checkout.session.completed',
+    data: {
+      object: {
+        id: topupSessionId,
+        object: 'checkout.session',
+        payment_status: 'paid',
+        currency: 'usd',
+        amount_total: 1000,
+        payment_intent: 'pi_existing_key_topup',
+        payment_link: STRIPE_PAYMENT_LINK_ID,
+        client_reference_id: topupReference,
+      },
+    },
+  })
+  const topupSignature = stripe.webhooks.generateTestHeaderString({
+    payload: topupPayload,
+    secret: STRIPE_WEBHOOK_SECRET,
+  })
+  const topupWebhook = await fetch(`${baseUrl}/v1/credits/stripe-webhook`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Stripe-Signature': topupSignature,
+    },
+    body: topupPayload,
+  })
+  assert.equal(topupWebhook.status, 200)
+
+  const completedTopup = await fetch(`${baseUrl}/v1/credits/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: topupSessionId }),
+  })
+  assert.equal(completedTopup.status, 200)
+  assert.deepEqual(await completedTopup.json(), {
+    topped_up: true,
+    key_prefix: claim.api_key.slice(0, 17),
+    credit_units_added: 10_000_000,
+    balance_units: 19_999_000,
+    single_extractions_remaining: 19_999,
+  })
+  const toppedUpBalance = await fetch(`${baseUrl}/v1/credits/balance`, {
+    headers: { Authorization: `Bearer ${claim.api_key}` },
+  })
+  assert.equal(toppedUpBalance.status, 200)
+  assert.equal((await toppedUpBalance.json()).balance_units, 19_999_000)
 })
 
 test('rejects invalid and non-public targets before payment', async t => {

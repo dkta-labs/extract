@@ -1,6 +1,6 @@
 {
   "name": "extract",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Usage-priced API for extracting clean, LLM-ready markdown from public URLs via x402 or prepaid API keys",
   "main": "index.js",
   "type": "module",
