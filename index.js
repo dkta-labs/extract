@@ -1807,7 +1807,7 @@ app.get('/', (_req, res) => {
 <span class="t-keyword">const</span> <span class="t-var">paidFetch</span> = <span class="t-fn">wrapFetchWithPayment</span>(globalThis.fetch, <span class="t-var">client</span>);
 <span class="t-keyword">const</span> <span class="t-var">res</span> = <span class="t-keyword">await</span> <span class="t-fn">paidFetch</span>(
   <span class="t-string">"https://extract.dkta.dev/v1/extract?url=https://example.com&amp;format=markdown"</span>,
-  { headers: { <span class="t-string">"X-Request-ID"</span>: <span class="t-fn">randomUUID</span>() } }
+  { headers: { <span class="t-string">"X-Request-ID"</span>: globalThis.crypto.<span class="t-fn">randomUUID</span>() } }
 );
 <span class="t-keyword">const</span> { <span class="t-var">content</span>, <span class="t-var">title</span>, <span class="t-var">word_count</span> } = <span class="t-keyword">await</span> <span class="t-var">res</span>.<span class="t-fn">json</span>();</pre>
             </div>
