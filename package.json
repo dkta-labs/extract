@@ -35,7 +35,7 @@
     "stripe": "22.4.0"
   },
   "allowScripts": {
-    "@coinbase/x402@2.1.0": true
+    "@coinbase/x402@2.1.0": false
   },
   "devDependencies": {
     "@x402/fetch": "^2.20.0",
