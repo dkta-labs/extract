@@ -1,6 +1,7 @@
 {
   "name": "extract",
   "version": "2.2.0",
+  "packageManager": "npm@12.0.2",
   "description": "Usage-priced API for extracting clean, LLM-ready markdown from public URLs via x402 or prepaid API keys",
   "main": "index.js",
   "type": "module",
@@ -32,6 +33,9 @@
     "jsdom": "^29.1.1",
     "node-fetch": "^3.3.2",
     "stripe": "22.4.0"
+  },
+  "allowScripts": {
+    "@coinbase/x402@2.1.0": false
   },
   "devDependencies": {
     "@x402/fetch": "^2.20.0",
