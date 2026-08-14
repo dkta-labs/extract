@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "sourceURI": "https://github.com/dkta-labs/extract",
+  "source": "..",
+  "workdir": "/workspace",
+  "network": "none",
+  "writablePaths": [
+    "/capsule-tmp"
+  ],
+  "environment": {
+    "TMPDIR": "/capsule-tmp"
+  },
+  "command": [
+    "node",
+    "--test",
+    "test/credits.test.mjs",
+    "test/request-log.test.mjs"
+  ],
+  "minimumReleaseAgeDays": 3,
+  "denyFeeds": [
+    "https://socket.dev/api/public/supply-chain-attacks/keyv-and-cacheable-compromise/packages.csv"
+  ],
+  "intake": {
+    "dockerfile": "Dockerfile",
+    "inputs": [
+      "package.json",
+      "package-lock.json"
+    ],
+    "lockfile": "package-lock.json"
+  },
+  "resolver": {
+    "image": "ghcr.io/dkta-labs/npm-resolver@sha256:2325ccfef8e9db2b1ad0ccf3db1fa228ae4b271ff6eff21dcfc572429d3c20c4",
+    "npmVersion": "12.0.2"
+  }
+}

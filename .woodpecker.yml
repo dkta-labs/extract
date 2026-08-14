@@ -1,0 +1,140 @@
+labels:
+  location: daimon
+
+when:
+  - event: pull_request
+  - event: push
+    branch: main
+
+clone:
+  git:
+    image: docker.io/woodpeckerci/plugin-git:2.9.2@sha256:a36586dfe77e9c5d9b5bff3ad37f18158eb12036aa9e9908e2e813ee6029573e
+    settings:
+      partial: false
+      depth: 50
+
+services:
+  - name: docker
+    image: docker.io/library/docker:29.1.5-dind@sha256:0ff14e6a992f2fdb7bef46123cd7fe61a58df0494e8df8bb6f9a5dac7486e1cb
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    commands:
+      - set -eu
+      - umask 077
+      - git_dir="/woodpecker/src/github.com/dkta-labs/extract/.git"
+      - test -d "$git_dir"
+      - mount -t tmpfs -o size=64k,mode=0700,nosuid,nodev,noexec tmpfs "$git_dir"
+      - mountpoint -q "$git_dir"
+      - test -z "$(ls -A "$git_dir")"
+      - socket_dir="/woodpecker/src/.capsule-engine-${CI_PIPELINE_NUMBER}"
+      - mkdir -p "$socket_dir"
+      - chmod 700 "$socket_dir"
+      - exec dockerd-entrypoint.sh --storage-driver=overlay2 --tls=false --host="unix://$socket_dir/docker.sock"
+
+steps:
+  - name: build-reviewed-capsulectl
+    image: docker.io/library/golang:1.24.0@sha256:3f7444391c51a11a039bf0359ee81cc64e663c17d787ad0e637a4de1a3f62a71
+    commands:
+      - set -eu
+      - mkdir -p .capsule/ci /tmp/dkt208-go-modcache /tmp/dkt208-go-cache /tmp/dkt208-go-path
+      - export GOMODCACHE=/tmp/dkt208-go-modcache
+      - export GOCACHE=/tmp/dkt208-go-cache
+      - export GOPATH=/tmp/dkt208-go-path
+      - CGO_ENABLED=0 GOTOOLCHAIN=local GOBIN="$PWD/.capsule/ci" go install -trimpath -buildvcs=false github.com/dkta-labs/capsulectl/cmd/capsulectl@db24ace52f202d622cd2ad7f7ed24c54e79fd379
+      - test -x .capsule/ci/capsulectl
+
+  - name: run-credential-blind-offline-tests
+    image: docker.io/library/docker:29.1.5-cli@sha256:05dfa31f4afd64888ef4cc0cbb1ab4d07a4828ef01cd29baa891fecbe50faf49
+    commands:
+      - |
+        set -eu
+        repo_dir="$(pwd -P)"
+        cli_image="docker.io/library/docker:29.1.5-cli@sha256:05dfa31f4afd64888ef4cc0cbb1ab4d07a4828ef01cd29baa891fecbe50faf49"
+        export DOCKER_HOST="unix:///woodpecker/src/.capsule-engine-${CI_PIPELINE_NUMBER}/docker.sock"
+        export CAPSULECTL_EPHEMERAL_CI=1
+        host_canary="/woodpecker/src/.extract-host-only-canary"
+        socket_dir="/woodpecker/src/.capsule-engine-${CI_PIPELINE_NUMBER}"
+        staging_parent="/woodpecker/src/.extract-staging-parent-${CI_PIPELINE_NUMBER}"
+        staging_probe="$staging_parent/probe"
+        git_canary=".git/.dkt208-git-canary"
+        source_root_marker=".dkt208-source-root-marker"
+        listener_port=43127
+        listener_container="extract-capsule-listener-${CI_PIPELINE_NUMBER}"
+        lockfile_backup="/tmp/extract-package-lock-${CI_PIPELINE_NUMBER}"
+        deny_fixture="/tmp/extract-deny-fixture-${CI_PIPELINE_NUMBER}"
+        deny_bin="/tmp/extract-deny-bin-${CI_PIPELINE_NUMBER}"
+        cleanup() {
+          if [ -f "$lockfile_backup" ]; then cp "$lockfile_backup" package-lock.json; fi
+          rm -f "$host_canary" "$git_canary" "$source_root_marker"
+          docker rm --force "$listener_container" >/dev/null 2>&1 || true
+          rm -rf "$socket_dir" "$staging_parent" "$deny_fixture" "$deny_bin" "$lockfile_backup"
+        }
+        trap cleanup EXIT
+        case "$host_canary" in "$repo_dir"/*) echo 'host canary must be outside checkout' >&2; exit 1;; esac
+        case "$socket_dir" in "$repo_dir"/*) echo 'capsule socket must be outside checkout' >&2; exit 1;; esac
+        case "$staging_parent" in "$repo_dir"/*) echo 'staging parent must be outside checkout' >&2; exit 1;; esac
+        printf '%s\n' capsule-host-only > "$host_canary"
+        printf '%s\n' real-git-only > "$git_canary"
+        printf '%s\n' source-root-only > "$source_root_marker"
+        ready=false
+        for attempt in $(seq 1 60); do if docker info >/dev/null 2>&1; then ready=true; break; fi; sleep 1; done
+        test "$ready" = true
+        test "$(docker info --format '{{.Driver}}')" = overlay2
+        docker run --rm --mount "type=bind,src=$host_canary,dst=/canary,readonly" "$cli_image" sh -eu -c 'test "$(cat /canary)" = capsule-host-only'
+        docker run --rm --mount "type=bind,src=$repo_dir,dst=/checkout,readonly" "$cli_image" sh -eu -c 'test "$(cat /checkout/.dkt208-source-root-marker)" = source-root-only && test ! -e /checkout/.git/.dkt208-git-canary'
+        mkdir -p "$staging_parent"
+        printf '%s\n' staging-parent > "$staging_probe"
+        docker run --rm --mount "type=bind,src=$staging_probe,dst=/probe,readonly" "$cli_image" sh -eu -c 'test "$(cat /probe)" = staging-parent'
+        intake_result="$(.capsule/ci/capsulectl intake --spec .capsule/capsule.json)"
+        printf '%s\n' "$intake_result"
+        capsule_image="$(printf '%s\n' "$intake_result" | sed -n 's/.*"image": "\(sha256:[0-9a-f]\{64\}\)",/\1/p')"
+        test -n "$capsule_image"
+        .capsule/ci/capsulectl check --spec .capsule/capsule.json
+        .capsule/ci/capsulectl plan --spec .capsule/capsule.json
+        cp package-lock.json "$lockfile_backup"
+        printf '\n' >> package-lock.json
+        if .capsule/ci/capsulectl check --spec .capsule/capsule.json >/tmp/dkt208-lock-drift.out 2>&1; then
+          cat /tmp/dkt208-lock-drift.out >&2
+          echo 'lockfile drift was accepted' >&2
+          exit 1
+        fi
+        cp "$lockfile_backup" package-lock.json
+        cmp -s package-lock.json "$lockfile_backup"
+        rm -f "$lockfile_backup"
+        .capsule/ci/capsulectl check --spec .capsule/capsule.json
+        .capsule/ci/capsulectl run --spec .capsule/capsule.json
+        docker run --detach --name "$listener_container" "$capsule_image" node -e 'const net=require("node:net"); const port=Number(process.argv[1]); net.createServer(socket=>socket.end("ok")).listen(port,"0.0.0.0")' "$listener_port"
+        listener_ip="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$listener_container")"
+        test -n "$listener_ip"
+        docker run --rm --network bridge "$capsule_image" node -e 'const net=require("node:net"); const socket=net.createConnection({host:process.argv[1],port:Number(process.argv[2])}); const timer=setTimeout(()=>{socket.destroy(); process.exit(1)},2000); socket.once("connect",()=>{clearTimeout(timer); socket.destroy(); process.exit(0)}); socket.once("error",()=>{clearTimeout(timer); process.exit(1)})' "$listener_ip" "$listener_port"
+        AWS_SECRET_ACCESS_KEY=dkt208-synthetic-canary CAPSULE_HOST_CANARY=dkt208-synthetic-canary .capsule/ci/capsulectl run --spec .capsule/capsule.json -- node test/capsule-boundary-canary.mjs "$host_canary" "$listener_ip" "$listener_port" first
+        AWS_SECRET_ACCESS_KEY=dkt208-synthetic-canary CAPSULE_HOST_CANARY=dkt208-synthetic-canary .capsule/ci/capsulectl run --spec .capsule/capsule.json -- node test/capsule-boundary-canary.mjs "$host_canary" "$listener_ip" "$listener_port" fresh
+        mkdir -p "$deny_fixture/.capsule" "$deny_bin"
+        cp .capsule/Dockerfile "$deny_fixture/.capsule/Dockerfile"
+        cat > "$deny_fixture/package.json" <<'JSON'
+        {"name":"extract-deny-feed-canary","version":"1.0.0"}
+        JSON
+        cat > "$deny_fixture/package-lock.json" <<'JSON'
+        {"name":"extract-deny-feed-canary","version": "1.0.0","lockfileVersion":3,"packages":{"":{"name":"extract-deny-feed-canary","version":"1.0.0"},"node_modules/keyv":{"version":"6.0.0"}}}
+        JSON
+        cat > "$deny_fixture/.capsule/capsule.json" <<JSON
+        {"schema":1,"sourceURI":"https://github.com/dkta-labs/extract","source":"..","workdir":"/workspace","network":"none","command":["node","--version"],"minimumReleaseAgeDays":3,"denyFeeds":["https://socket.dev/api/public/supply-chain-attacks/keyv-and-cacheable-compromise/packages.csv"],"intake":{"dockerfile":"Dockerfile","inputs":["package.json","package-lock.json"],"lockfile":"package-lock.json"},"resolver":{"image":"ghcr.io/dkta-labs/npm-resolver@sha256:2325ccfef8e9db2b1ad0ccf3db1fa228ae4b271ff6eff21dcfc572429d3c20c4","npmVersion":"12.0.2"}}
+        JSON
+        real_docker="$(command -v docker)"
+        deny_marker="$deny_fixture/docker-invoked"
+        cat > "$deny_bin/docker" <<EOF
+        #!/bin/sh
+        set -eu
+        if [ "\$1" = context ] && [ "\$2" = inspect ]; then exec "$real_docker" "\$@"; fi
+        : > "$deny_marker"
+        exit 97
+        EOF
+        chmod 700 "$deny_bin/docker"
+        if PATH="$deny_bin:$PATH" .capsule/ci/capsulectl intake --spec "$deny_fixture/.capsule/capsule.json" >/tmp/dkt208-deny-feed.out 2>&1; then
+          cat /tmp/dkt208-deny-feed.out >&2
+          echo 'deny-feed canary unexpectedly accepted keyv@6.0.0' >&2
+          exit 1
+        fi
+        test ! -e "$deny_marker"
+        grep -F 'deny feed blocks dependency artifacts: keyv@6.0.0' /tmp/dkt208-deny-feed.out
