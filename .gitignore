@@ -1,3 +1,5 @@
 node_modules/
 .env
 *.log
+.capsule/state.json
+.capsule/intake.cdx.json
