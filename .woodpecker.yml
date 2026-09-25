@@ -3,8 +3,12 @@ labels:
 
 when:
   - event: pull_request
+    path:
+      exclude: ['**/*.md', 'docs/**']
   - event: push
     branch: main
+    path:
+      exclude: ['**/*.md', 'docs/**']
 
 clone:
   git:
